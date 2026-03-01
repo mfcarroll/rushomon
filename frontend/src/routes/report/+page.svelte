@@ -1,10 +1,23 @@
 <script lang="ts">
 	import { goto } from "$app/navigation";
 	import { apiClient } from "$lib/api/client";
+	import { authApi } from "$lib/api/auth";
+	import { onMount } from "svelte";
 	import type { User } from "$lib/types/api";
 
 	let { data } = $props();
-	let currentUser: User | undefined = $derived(data.user);
+	let currentUser = $state<User | undefined>(undefined);
+
+	onMount(async () => {
+		// Try to get user data on client side
+		try {
+			const user = await authApi.me();
+			currentUser = user;
+		} catch (error) {
+			// User not authenticated, that's fine for public pages
+			currentUser = undefined;
+		}
+	});
 
 	let showReportDialog = $state(false);
 	let reportingLink = $state("");
@@ -324,7 +337,7 @@
 							? "(authenticated)"
 							: "(optional)"}</label
 					>
-					{#if currentUser}
+					{#if currentUser && currentUser.email}
 						<div class="authenticated-user-info">
 							<span class="user-email">{currentUser.email}</span>
 							<span class="user-badge">Logged in</span>
