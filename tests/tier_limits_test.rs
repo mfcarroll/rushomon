@@ -242,6 +242,22 @@ async fn test_free_tier_and_unlimited_tier_limits() {
             .await;
     }
 
+    // Reset monthly counter to ensure subsequent tests start with clean quota
+    let reset_counter_response = client
+        .post(format!(
+            "{}/api/admin/billing-accounts/{}/reset-counter",
+            BASE_URL, billing_account_id
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        reset_counter_response.status(),
+        200,
+        "Failed to reset monthly counter"
+    );
+
     // Reset billing account back to unlimited tier for subsequent tests
     let reset_response = client
         .put(format!(
@@ -336,11 +352,11 @@ async fn test_free_tier_cannot_create_custom_short_code() {
         "Free tier should not be able to create custom short codes"
     );
 
-    // Verify error message mentions upgrade
+    // Verify error message mentions upgrading to Pro (not "Unlimited")
     let error_text = response.text().await.unwrap();
     assert!(
-        error_text.contains("Upgrade") || error_text.contains("Unlimited"),
-        "Error message should mention upgrade: {}",
+        error_text.contains("Pro"),
+        "Error message should mention upgrading to Pro: {}",
         error_text
     );
 
