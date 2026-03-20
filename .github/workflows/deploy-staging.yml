@@ -68,6 +68,13 @@ jobs:
           enabled = true
           head_sampling_rate = 0.1
 
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          [triggers]
+          crons = ["0 0 * * *", "0 4 * * *"]
+
           [[d1_databases]]
           binding = "rushomon"
           database_name = "rushomon"
@@ -158,6 +165,13 @@ jobs:
           enabled = true
           head_sampling_rate = 0.1
 
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          [triggers]
+          crons = ["0 0 * * *", "0 4 * * *"]
+
           [[d1_databases]]
           binding = "rushomon"
           database_name = "rushomon"
@@ -241,6 +255,7 @@ jobs:
         env:
           PUBLIC_VITE_API_BASE_URL: https://${{ secrets.WEB_DOMAIN }}
           PUBLIC_VITE_SHORT_LINK_BASE_URL: https://${{ secrets.REDIRECT_DOMAIN }}
+          PUBLIC_VITE_SITE_URL: https://${{ secrets.WEB_DOMAIN }}
         run: npm run build
 
       - name: Apply database migrations

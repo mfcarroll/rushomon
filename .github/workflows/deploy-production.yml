@@ -66,6 +66,13 @@ jobs:
           enabled = true
           head_sampling_rate = 0.1
 
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          [triggers]
+          crons = ["0 0 * * *", "0 4 * * *"]
+
           [[d1_databases]]
           binding = "rushomon"
           database_name = "rushomon"
@@ -172,10 +179,12 @@ jobs:
         env:
           PUBLIC_VITE_API_BASE_URL: https://${{ secrets.API_DOMAIN }}
           PUBLIC_VITE_SHORT_LINK_BASE_URL: https://${{ secrets.REDIRECT_DOMAIN }}
+          PUBLIC_VITE_SITE_URL: https://${{ secrets.WEB_DOMAIN }}
         run: |
           echo "🔨 Building frontend for unified Worker deployment"
           echo "   API Base URL: https://${{ secrets.API_DOMAIN }}"
           echo "   Short Link Base URL: https://${{ secrets.REDIRECT_DOMAIN }}"
+          echo "   Site URL: https://${{ secrets.WEB_DOMAIN }}"
           npm run build
 
       - name: Generate Production wrangler.toml
@@ -205,6 +214,13 @@ jobs:
           [observability.traces]
           enabled = true
           head_sampling_rate = 0.1
+
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          [triggers]
+          crons = ["0 0 * * *", "0 4 * * *"]
 
           [[d1_databases]]
           binding = "rushomon"

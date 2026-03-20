@@ -56,6 +56,13 @@ head_sampling_rate = 1
 enabled = true
 head_sampling_rate = 0.1
 
+# Cron Triggers for scheduled tasks
+# Format: array of cron expressions (Cloudflare doesn't support named triggers)
+# - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+# - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+[triggers]
+crons = ["0 0 * * *", "0 4 * * *"]
+
 [[d1_databases]]
 binding = "rushomon"
 database_id = "${D1_DATABASE_ID}"
@@ -109,7 +116,7 @@ EOF
   fi
 
   # Add Polar configuration if enabled
-  if [ "$POLAR_ENABLED" = true ] && [ -n "$POLAR_ACCESS_TOKEN" ]; then
+  if [ "${POLAR_ENABLED:-false}" = true ] && [ -n "${POLAR_ACCESS_TOKEN:-}" ]; then
     cat >> "$output_file" <<EOF
 POLAR_PRO_MONTHLY_PRODUCT_ID = "${POLAR_PRO_MONTHLY_PRODUCT_ID:-}"
 POLAR_PRO_ANNUAL_PRODUCT_ID = "${POLAR_PRO_ANNUAL_PRODUCT_ID:-}"
@@ -336,7 +343,7 @@ set_worker_secrets() {
   fi
 
   # Set Polar secrets (if enabled)
-  if [ "$POLAR_ENABLED" = true ] && [ -n "$POLAR_ACCESS_TOKEN" ]; then
+  if [ "${POLAR_ENABLED:-false}" = true ] && [ -n "${POLAR_ACCESS_TOKEN:-}" ]; then
     echo "$POLAR_ACCESS_TOKEN" | wrangler secret put POLAR_ACCESS_TOKEN --config "$config_file" || {
       error "Failed to set POLAR_ACCESS_TOKEN"
       return 1

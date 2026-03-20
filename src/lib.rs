@@ -11,6 +11,7 @@ mod kv;
 mod middleware;
 mod models;
 mod router;
+mod scheduled;
 pub mod utils;
 
 // Thread-local storage for deferred analytics futures from redirect handlers.
@@ -370,6 +371,7 @@ async fn main(req: Request, env: Env, worker_ctx: Context) -> Result<Response> {
         .options_async("/api/billing/pricing", handle_cors_preflight)
         .options_async("/api/billing/webhook", handle_cors_preflight)
         .options_async("/api/billing/portal", handle_cors_preflight)
+        .options_async("/api/admin/cron/trigger-downgrade", handle_cors_preflight)
         .options_async("/api/settings", handle_cors_preflight)
         .options_async("/api/settings/api-keys", handle_cors_preflight)
         .options_async("/api/settings/api-keys/:id", handle_cors_preflight)
@@ -556,6 +558,14 @@ async fn main(req: Request, env: Env, worker_ctx: Context) -> Result<Response> {
         )
         .post_async("/api/billing/webhook", crate::api::billing::handle_webhook)
         .post_async("/api/billing/portal", crate::api::billing::handle_portal)
+        .post_async(
+            "/api/admin/cron/trigger-downgrade",
+            crate::api::billing::handle_cron_trigger_downgrade,
+        )
+        .post_async(
+            "/api/admin/billing-accounts/:id/reset",
+            crate::api::billing::handle_admin_reset_billing_account,
+        )
         // Org analytics route
         .get_async(
             "/api/analytics/org",
@@ -578,7 +588,7 @@ async fn main(req: Request, env: Env, worker_ctx: Context) -> Result<Response> {
         worker_ctx.wait_until(analytics_future);
     }
 
-    // SPA fallback: if router returned 404 on the frontend domain, serve index.html.
+    // SPA fallback: if router returned 404 on the frontend domain, serve fallback.html.
     // This enables client-side routing for paths like /dashboard, /auth/callback, etc.
     // Short code redirects are already handled by the router above (returning 301/302).
     if response.status_code() == 404
@@ -586,7 +596,7 @@ async fn main(req: Request, env: Env, worker_ctx: Context) -> Result<Response> {
         && !path.starts_with("/api/")
         && let Ok(assets) = env.get_binding::<worker::Fetcher>("ASSETS")
     {
-        let fallback_url = format!("{}://{}/index.html", url.scheme(), &request_authority);
+        let fallback_url = format!("{}://{}/fallback.html", url.scheme(), &request_authority);
         if let Ok(fallback_response) = assets.fetch(fallback_url, None).await
             && fallback_response.status_code() < 400
         {
