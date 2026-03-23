@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from "svelte";
 	import { adminApi } from "$lib/api/admin";
+	import Pagination from "$lib/components/Pagination.svelte";
 	import type {
 		BillingAccountWithStats,
 		BillingAccountDetails,
@@ -8,6 +9,7 @@
 
 	let accounts = $state<BillingAccountWithStats[]>([]);
 	let total = $state(0);
+	let nextReset = $state<{ utc: string; timestamp: number } | null>(null);
 	let loading = $state(false);
 	let error = $state("");
 	let currentPage = $state(1);
@@ -65,13 +67,14 @@
 			loading = true;
 			const response = await adminApi.listBillingAccounts(
 				currentPage,
-				50,
+				20,
 				searchQuery || undefined,
 				tierFilter || undefined,
 			);
 			accounts = response.accounts;
 			total = response.total;
-			
+			nextReset = response.next_reset || null;
+
 			// Load subscription info for all visible accounts to show status badges
 			await loadSubscriptionInfoForAllAccounts();
 		} catch (err) {
@@ -252,7 +255,7 @@
 		return tier.charAt(0).toUpperCase() + tier.slice(1);
 	}
 
-	const totalPages = $derived(Math.ceil(total / 50));
+	const totalPages = $derived(Math.ceil(total / 20));
 </script>
 
 <div class="billing-page">
@@ -426,16 +429,14 @@
 												></div>
 											</div>
 										{/if}
-										{#if details.usage.max_links_per_month}
+										{#if details.usage.max_links_per_month && nextReset}
 											{@const now = Date.now() / 1000}
-											{@const nextReset = new Date()}
-											{@const nextResetTimestamp = (nextReset.setUTCMonth(nextReset.getUTCMonth() + 1, 1), nextReset.setUTCHours(0, 0, 0, 0), nextReset.getTime() / 1000)}
-											{@const diffSeconds = nextResetTimestamp - now}
+											{@const diffSeconds = nextReset.timestamp - now}
 											{@const diffDays = Math.floor(diffSeconds / (60 * 60 * 24))}
 											{@const diffHours = Math.floor((diffSeconds % (60 * 60 * 24)) / (60 * 60))}
 											{@const diffMinutes = Math.floor((diffSeconds % (60 * 60)) / 60)}
 											{@const countdownText = diffDays > 0 ? `in ${diffDays}d ${diffHours}h` : diffHours > 0 ? `in ${diffHours}h ${diffMinutes}m` : `in ${diffMinutes}m`}
-											{@const resetDateStr = nextReset.toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+											{@const resetDateStr = new Date(nextReset.timestamp * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
 											<div class="reset-info">
 												Resets {resetDateStr} UTC (00:00) {countdownText}
 											</div>
@@ -648,26 +649,13 @@
 
 		<!-- Pagination -->
 		{#if totalPages > 1}
-			<div class="pagination">
-				<p class="pagination-info">
-					Page {currentPage} of {totalPages} ({total} total accounts)
-				</p>
-				<div class="pagination-controls">
-					<button
-						onclick={() => handlePageChange(currentPage - 1)}
-						disabled={currentPage <= 1 || loading}
-						class="pagination-btn"
-					>
-						Previous
-					</button>
-					<button
-						onclick={() => handlePageChange(currentPage + 1)}
-						disabled={currentPage >= totalPages || loading}
-						class="pagination-btn"
-					>
-						Next
-					</button>
-				</div>
+			<div class="mt-6">
+				<Pagination
+					currentPage={currentPage}
+					totalPages={totalPages}
+					onPageChange={handlePageChange}
+					loading={loading}
+				/>
 			</div>
 		{/if}
 	{/if}
@@ -1238,49 +1226,6 @@
 		cursor: not-allowed;
 	}
 
-	.pagination {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		padding: 1rem;
-		margin-top: 2rem;
-		background: white;
-		border-radius: 8px;
-		border: 1px solid #e2e8f0;
-	}
-
-	.pagination-info {
-		color: #64748b;
-		font-size: 0.875rem;
-		margin: 0;
-	}
-
-	.pagination-controls {
-		display: flex;
-		gap: 0.5rem;
-	}
-
-	.pagination-btn {
-		padding: 0.5rem 1rem;
-		border: 1px solid #d1d5db;
-		background: white;
-		color: #374151;
-		border-radius: 6px;
-		font-size: 0.875rem;
-		cursor: pointer;
-		transition: all 0.2s;
-	}
-
-	.pagination-btn:hover:not(:disabled) {
-		background: #f9fafb;
-		border-color: #9ca3af;
-	}
-
-	.pagination-btn:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
 	/* Modal Styles */
 	.modal-backdrop {
 		position: fixed;
@@ -1493,5 +1438,82 @@
 	.info {
 		color: #0369a1;
 		font-size: 0.875rem;
+	}
+
+	/* Responsive */
+	@media (max-width: 768px) {
+		.billing-page {
+			padding-top: 3rem;
+		}
+
+		.page-header h1 {
+			font-size: 1.5rem;
+		}
+
+		.filters {
+			flex-direction: column;
+		}
+
+		.search-input,
+		.tier-filter {
+			width: 100%;
+		}
+
+		.account-card {
+			margin-bottom: 1rem;
+		}
+
+		.card-header {
+			padding: 1rem;
+			grid-template-columns: 1fr auto;
+			grid-template-areas:
+				"owner tier"
+				"status status"
+				"usage usage"
+				"orgs icon";
+			gap: 0.5rem;
+		}
+
+		.card-header .owner {
+			grid-area: owner;
+			font-weight: 600;
+		}
+
+		.card-header .tier-badge {
+			grid-area: tier;
+		}
+
+		.card-header .subscription-status-badge {
+			grid-area: status;
+		}
+
+		.card-header .usage {
+			grid-area: usage;
+		}
+
+		.card-header .orgs {
+			grid-area: orgs;
+		}
+
+		.card-header .icon {
+			grid-area: icon;
+		}
+
+		.card-body {
+			padding: 1rem;
+		}
+
+		.section {
+			margin-bottom: 1rem;
+		}
+
+		.info-grid {
+			grid-template-columns: 1fr;
+		}
+
+		.actions {
+			flex-direction: column;
+			gap: 0.5rem;
+		}
 	}
 </style>
