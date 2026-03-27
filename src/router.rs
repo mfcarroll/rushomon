@@ -8,7 +8,10 @@ use crate::models::{
 };
 use crate::utils::{
     generate_short_code_with_length, now_timestamp,
-    short_code::{DEFAULT_COLLISION_THRESHOLD, MAX_SHORT_CODE_LENGTH},
+    short_code::{
+        DEFAULT_COLLISION_THRESHOLD, DEFAULT_MIN_CUSTOM_CODE_LENGTH,
+        DEFAULT_MIN_RANDOM_CODE_LENGTH, DEFAULT_SYSTEM_MIN_CODE_LENGTH, MAX_SHORT_CODE_LENGTH,
+    },
     validate_short_code, validate_url,
 };
 use chrono::{Datelike, TimeZone};
@@ -552,9 +555,23 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
         return Response::error(error_msg, 403);
     }
 
-    let min_random_length = db::get_min_random_code_length(&db).await?;
-    let min_custom_length = db::get_min_custom_code_length(&db).await?;
-    let system_min_length = db::get_system_min_code_length(&db).await?;
+    // Fetch all settings in a single query for performance
+    let settings = db::get_all_settings(&db).await?;
+
+    let min_random_length = settings
+        .get("min_random_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_RANDOM_CODE_LENGTH);
+
+    let min_custom_length = settings
+        .get("min_custom_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_CUSTOM_CODE_LENGTH);
+
+    let system_min_length = settings
+        .get("system_min_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SYSTEM_MIN_CODE_LENGTH);
 
     // Custom codes must respect the higher of the custom rule or system physical floor
     let effective_custom_min = min_custom_length.max(system_min_length);
@@ -1490,9 +1507,24 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
         format!("{}-{:02}", dt.year(), dt.month())
     };
 
-    let min_length = db::get_min_random_code_length(&db).await?;
-    let system_min_length = db::get_system_min_code_length(&db).await?;
-    let min_custom_length = db::get_min_custom_code_length(&db).await?;
+    let settings = db::get_all_settings(&db).await?;
+
+    // Note: The import function uses 'min_length' instead of 'min_random_length' for this variable
+    let min_length = settings
+        .get("min_random_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_RANDOM_CODE_LENGTH);
+
+    let min_custom_length = settings
+        .get("min_custom_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_CUSTOM_CODE_LENGTH);
+
+    let system_min_length = settings
+        .get("system_min_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SYSTEM_MIN_CODE_LENGTH);
+
     let effective_custom_min = min_custom_length.max(system_min_length);
 
     let mut created: usize = 0;
