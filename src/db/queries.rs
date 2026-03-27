@@ -1,9 +1,7 @@
 use crate::models::{BillingAccount, Link, Organization, User, user::CreateUserData};
 use crate::repositories::link_repository::{AdminLink, serialize_optional_int_as_bool};
 use crate::utils::now_timestamp;
-use crate::utils::short_code::{
-    DEFAULT_MIN_CUSTOM_CODE_LENGTH, DEFAULT_MIN_RANDOM_CODE_LENGTH, DEFAULT_SYSTEM_MIN_CODE_LENGTH,
-};
+use crate::utils::short_code::DEFAULT_SYSTEM_MIN_CODE_LENGTH;
 use wasm_bindgen::JsValue;
 use worker::d1::D1Database;
 use worker::*;
@@ -333,24 +331,6 @@ pub async fn get_all_users(db: &D1Database, limit: i64, offset: i64) -> Result<V
 
 // suspend_user, unsuspend_user, delete_user, get_links_by_creator, get_links_by_org,
 // is_last_admin_in_org moved to UserRepository
-
-/// Helper to fetch and parse the minimum random code length
-pub async fn get_min_random_code_length(db: &D1Database) -> Result<usize> {
-    let settings_repo = crate::repositories::SettingsRepository::new();
-    Ok(settings_repo.get_setting(db, "min_random_code_length")
-        .await?
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MIN_RANDOM_CODE_LENGTH))
-}
-
-/// Helper to fetch and parse the minimum custom code length
-pub async fn get_min_custom_code_length(db: &D1Database) -> Result<usize> {
-    let settings_repo = crate::repositories::SettingsRepository::new();
-    Ok(settings_repo.get_setting(db, "min_custom_code_length")
-        .await?
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MIN_CUSTOM_CODE_LENGTH))
-}
 
 /// Helper to fetch the current code length high watermark
 pub async fn get_system_min_code_length(db: &D1Database) -> Result<usize> {
