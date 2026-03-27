@@ -1,14 +1,16 @@
 <script lang="ts">
-  import { goto, invalidate } from "$app/navigation";
+import { goto, invalidate } from "$app/navigation";
   import { linksApi, tagsApi } from "$lib/api/links";
   import LinkList from "$lib/components/LinkList.svelte";
   import LinkModal from "$lib/components/LinkModal.svelte";
   import Pagination from "$lib/components/Pagination.svelte";
   import QRCodeModal from "$lib/components/QRCodeModal.svelte";
   import SearchFilterBar from "$lib/components/SearchFilterBar.svelte";
+  import { DEFAULT_MIN_CUSTOM_CODE_LENGTH, DEFAULT_SYSTEM_MIN_CODE_LENGTH } from "$lib/constants";
   import type {
     ApiError,
     Link,
+    PaginatedResponse,
     PaginationMeta,
     TagWithCount,
     UsageResponse,
@@ -63,15 +65,25 @@
 
   let highlightTimer: ReturnType<typeof setTimeout>;
 
-  // Filter states - initialize from data props
+  const effectiveMinLength = $derived(
+    (data as any).publicSettings?.min_custom_code_length || DEFAULT_MIN_CUSTOM_CODE_LENGTH
+  );
+
+  // Filter states
   let search = $state<string>("");
   let status = $state<"all" | "active" | "disabled">("all");
-  let sort = $state<"created" | "updated" | "clicks" | "title" | "code">(
-    "created"
-  );
+  let sort = $state<"created" | "updated" | "clicks" | "title" | "code">("created");
   let selectedTags = $state<string[]>([]);
   let availableTags = $state<TagWithCount[]>([]);
 
+  // Initialize from data props using derived
+  $effect(() => {
+    search = data.initialSearch || "";
+    status = data.initialStatus || "all";
+    sort = (data.initialSort as "created" | "updated" | "clicks" | "title" | "code") || "created";
+    selectedTags = data.initialTags || [];
+    orgId = data.orgId || "";
+  });
   // Initialize from data props using derived
   $effect(() => {
     search = data.initialSearch || "";
@@ -407,7 +419,7 @@
           <button
             onclick={handleCreateNew}
             disabled={linksAtLimit}
-            class="bg-gradient-to-r from-orange-500 to-orange-600 text-white px-5 py-2 rounded-lg shadow hover:shadow-md transition-all duration-200 font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            class="bg-linear-to-r from-orange-500 to-orange-600 text-white px-5 py-2 rounded-lg shadow hover:shadow-md transition-all duration-200 font-semibold text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             title={linksAtLimit
               ? "Monthly link limit reached"
               : "Create a new short link"}
@@ -680,6 +692,7 @@
         link={editingLink}
         bind:isOpen={isModalOpen}
         {usage}
+        minShortCodeLength={effectiveMinLength}
         on:saved={handleLinkSaved}
       />
 

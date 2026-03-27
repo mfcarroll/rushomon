@@ -2,6 +2,7 @@
   import { goto } from "$app/navigation";
   import type { ImportBatchResult, ImportLinkRow } from "$lib/api/links";
   import { linksApi } from "$lib/api/links";
+  import { MAX_SHORT_CODE_LENGTH } from "$lib/constants";
   import type { UsageResponse } from "$lib/types/api";
   import { SvelteMap } from "svelte/reactivity";
 
@@ -107,7 +108,6 @@
 
   // ── Step 5: Progress + Results ────────────────────────────────────────────
   const BATCH_SIZE = 50;
-  const MAX_SHORT_CODE_LENGTH = 100;
   let progress = $state(0); // 0-100
   let importDone = $state(false);
   let totalCreated = $state(0);
@@ -646,7 +646,7 @@
           </button>
           <button
             onclick={goToPreview}
-            class="bg-gradient-to-r from-orange-500 to-orange-600 text-white px-6 py-2 rounded-lg font-semibold text-sm hover:shadow-md transition-all"
+            class="bg-linear-to-r from-orange-500 to-orange-600 text-white px-6 py-2 rounded-lg font-semibold text-sm hover:shadow-md transition-all"
           >
             Preview rows →
           </button>
@@ -705,13 +705,13 @@
                       {#if row.wasTruncated}
                         <span
                           class="ml-1 text-amber-600 text-[10px] font-sans font-medium"
-                          >(truncated to 100)</span
+                          >(truncated to {MAX_SHORT_CODE_LENGTH})</span
                         >
                       {/if}
                     </td>
                   {/if}
                   {#if columnMap.title}
-                    <td class="px-3 py-2 text-gray-600 truncate max-w-[150px]"
+                    <td class="px-3 py-2 text-gray-600 truncate max-w-37.5"
                       >{row.title || "—"}</td
                     >
                   {/if}
@@ -741,7 +741,7 @@
           </button>
           <button
             onclick={goToSettings}
-            class="bg-gradient-to-r from-orange-500 to-orange-600 text-white px-6 py-2 rounded-lg font-semibold text-sm hover:shadow-md transition-all"
+            class="bg-linear-to-r from-orange-500 to-orange-600 text-white px-6 py-2 rounded-lg font-semibold text-sm hover:shadow-md transition-all"
           >
             Continue →
           </button>
@@ -857,7 +857,7 @@
           <button
             onclick={startImport}
             disabled={validRows.length === 0}
-            class="bg-gradient-to-r from-orange-500 to-orange-600 text-white px-6 py-2 rounded-lg font-semibold text-sm hover:shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            class="bg-linear-to-r from-orange-500 to-orange-600 text-white px-6 py-2 rounded-lg font-semibold text-sm hover:shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Import {validRows.length} links →
           </button>
@@ -875,7 +875,7 @@
           </p>
           <div class="w-full bg-gray-200 rounded-full h-3 mb-2">
             <div
-              class="bg-gradient-to-r from-orange-500 to-orange-600 h-3 rounded-full transition-all duration-300"
+              class="bg-linear-to-r from-orange-500 to-orange-600 h-3 rounded-full transition-all duration-300"
               style="width: {progress}%"
             ></div>
           </div>
@@ -913,7 +913,7 @@
             >
               <strong>{truncatedCount}</strong> short code{truncatedCount === 1
                 ? " was"
-                : "s were"} longer than 100 characters and {truncatedCount === 1
+                : "s were"} longer than {MAX_SHORT_CODE_LENGTH} characters and {truncatedCount === 1
                 ? "was"
                 : "were"} automatically truncated before import.
             </div>
@@ -990,7 +990,7 @@
           <div class="flex gap-3">
             <button
               onclick={() => goto("/dashboard")}
-              class="flex-1 bg-gradient-to-r from-orange-500 to-orange-600 text-white px-6 py-2.5 rounded-lg font-semibold text-sm hover:shadow-md transition-all text-center"
+              class="flex-1 bg-linear-to-r from-orange-500 to-orange-600 text-white px-6 py-2.5 rounded-lg font-semibold text-sm hover:shadow-md transition-all text-center"
             >
               Go to dashboard
             </button>

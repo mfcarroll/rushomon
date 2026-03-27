@@ -2,6 +2,12 @@
   import { adminApi, type Discount, type Product } from "$lib/api/admin";
   import { billingApi, type ProductPrice } from "$lib/api/billing";
   import { onMount } from "svelte";
+  import {
+    DEFAULT_MIN_RANDOM_CODE_LENGTH,
+    DEFAULT_MIN_CUSTOM_CODE_LENGTH,
+    DEFAULT_SYSTEM_MIN_CODE_LENGTH,
+    MAX_SHORT_CODE_LENGTH
+  } from "$lib/constants";
 
   let settings = $state<Record<string, string>>({});
   let loading = $state(false);
@@ -61,6 +67,11 @@
     business_annual: ""
   });
 
+  // Minimum code length
+  let minRandomCodeLength = $state(DEFAULT_MIN_RANDOM_CODE_LENGTH);
+  let minCustomCodeLength = $state(DEFAULT_MIN_CUSTOM_CODE_LENGTH);
+  let systemMinCodeLength = $state(DEFAULT_SYSTEM_MIN_CODE_LENGTH);
+
   // Filter discounts for a specific product
   function getDiscountsForSlot(slot: keyof typeof PRODUCT_IDS): Discount[] {
     const productId = PRODUCT_IDS[slot];
@@ -112,13 +123,25 @@
       settings = await adminApi.getSettings();
       signupsEnabled = settings.signups_enabled !== "false";
       defaultUserTier = settings.default_user_tier || "free";
+
+      // Load effective system minimum code length
+      systemMinCodeLength = parseInt(settings.system_min_code_length || DEFAULT_SYSTEM_MIN_CODE_LENGTH.toString());
+
+      // Ensure the Admin UI reflects the reality of the system, even if a lower value was set in db
+      minRandomCodeLength = Math.max(
+        systemMinCodeLength,
+        parseInt(settings.min_random_code_length || DEFAULT_MIN_RANDOM_CODE_LENGTH.toString())
+      );
+      minCustomCodeLength = Math.max(
+        systemMinCodeLength,
+        parseInt(settings.min_custom_code_length || DEFAULT_MIN_CUSTOM_CODE_LENGTH.toString())
+      );
+
       founderPricingEnabled = settings.founder_pricing_active === "true";
       discountSlots.pro_monthly = settings.active_discount_pro_monthly || "";
       discountSlots.pro_annual = settings.active_discount_pro_annual || "";
-      discountSlots.business_monthly =
-        settings.active_discount_business_monthly || "";
-      discountSlots.business_annual =
-        settings.active_discount_business_annual || "";
+      discountSlots.business_monthly = settings.active_discount_business_monthly || "";
+      discountSlots.business_annual = settings.active_discount_business_annual || "";
 
       // Load product slots and store initial values for change detection
       productSlots.pro_monthly = settings.product_pro_monthly_id || "";
@@ -390,6 +413,20 @@
     }
   }
 
+  async function handleUpdateSetting(key: string, value: string) {
+    saving = true;
+    try {
+      const updatedSettings = await adminApi.updateSetting(key, value);
+      settings = updatedSettings;
+      showToastMessage(`Setting updated`);
+    } catch (err) {
+      console.error(`Failed to update setting ${key}:`, err);
+      showToastMessage("Failed to update setting");
+    } finally {
+      saving = false;
+    }
+  }
+
   async function handleDefaultTierChange() {
     saving = true;
     try {
@@ -510,6 +547,48 @@
               <option value="free">Free</option>
               <option value="unlimited">Unlimited</option>
             </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Default Code Length Setting -->
+      <div class="setting-card">
+        <div class="setting-content">
+          <div class="setting-info">
+            <h3>Short code length limits</h3>
+            <p class="setting-description">
+              Set the minimum allowed characters for custom and random short codes.
+              <br/><span class="text-xs text-amber-600 font-medium">System Minimum: {systemMinCodeLength} (Automatically increases when shorter code combinations are exhausted).</span>
+            </p>
+          </div>
+          <div class="setting-control" style="display: flex; gap: 1rem;">
+            <div style="display: flex; flex-direction: column; align-items: center; gap: 0.25rem;">
+              <label for="min-random-length" class="text-xs text-gray-500 font-medium">Random</label>
+              <input
+                id="min-random-length"
+                type="number"
+                min={systemMinCodeLength}
+                max={MAX_SHORT_CODE_LENGTH}
+                bind:value={minRandomCodeLength}
+                onchange={() => handleUpdateSetting("min_random_code_length", minRandomCodeLength.toString())}
+                disabled={saving}
+                class="tier-select"
+                style="width: 80px; text-align: center;"
+              />
+            </div>
+            <div style="display: flex; flex-direction: column; align-items: center; gap: 0.25rem;">
+              <label for="min-custom-length" class="text-xs text-gray-500 font-medium">Custom</label>
+              <input
+                id="min-custom-length"
+                type="number"
+                min={systemMinCodeLength}
+                max={MAX_SHORT_CODE_LENGTH} bind:value={minCustomCodeLength}
+                onchange={() => handleUpdateSetting("min_custom_code_length", minCustomCodeLength.toString())}
+                disabled={saving}
+                class="tier-select"
+                style="width: 80px; text-align: center;"
+              />
+            </div>
           </div>
         </div>
       </div>

@@ -327,8 +327,6 @@ pub async fn handle_oauth_callback(req: Request, ctx: RouteContext<()>) -> Resul
     Ok(Response::empty()?.with_status(302).with_headers(headers))
 }
 
-// handle_admin_list_users and handle_admin_get_user moved to api/admin/users.rs
-
 #[utoipa::path(
     post,
     path = "/api/admin/orgs/{id}/reset-counter",

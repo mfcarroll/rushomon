@@ -8,10 +8,69 @@ use crate::models::{
 };
 use crate::repositories::tag_repository::validate_and_normalize_tags;
 use crate::repositories::{LinkRepository, TagRepository};
-use crate::utils::{generate_short_code, now_timestamp, validate_short_code, validate_url};
+use crate::utils::{
+    generate_short_code_with_length, now_timestamp,
+    short_code::{DEFAULT_COLLISION_THRESHOLD},
+    validate_short_code, validate_url,
+};
 use chrono::Datelike;
 use worker::d1::D1Database;
 use worker::*;
+
+/// Internal helper to generate a unique short code starting at a minimum length
+/// and scaling up if collisions are detected.
+async fn generate_progressive_short_code(
+    kv: &worker::kv::KvStore,
+    db: &D1Database,
+    env: &Env,
+    admin_min_length: usize,
+    system_min_length: usize,
+) -> Result<String> {
+    let collision_threshold = env
+        .var("COLLISION_THRESHOLD")
+        .ok()
+        .and_then(|v| v.to_string().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COLLISION_THRESHOLD);
+
+    let mut current_length = admin_min_length.max(system_min_length);
+    let mut total_attempts = 0;
+    let mut current_length_attempts = 0;
+
+    loop {
+        let code = generate_short_code_with_length(current_length);
+
+        if !crate::kv::links::short_code_exists(kv, &code).await? {
+            return Ok(code);
+        }
+
+        total_attempts += 1;
+        current_length_attempts += 1;
+
+        // Exhaustion Trigger: Dynamic threshold based on env var
+        if current_length_attempts >= collision_threshold {
+            current_length += 1;
+            current_length_attempts = 0;
+
+            let settings_repo = crate::repositories::SettingsRepository::new();
+            let _ = settings_repo
+                .set_setting(db, "system_min_code_length", &current_length.to_string())
+                .await;
+
+            if admin_min_length < current_length {
+                let _ = settings_repo
+                    .set_setting(db, "min_random_code_length", &current_length.to_string())
+                    .await;
+            }
+        }
+
+        // Scale the ultimate fail-safe based on the threshold too
+        if total_attempts > (collision_threshold * 3).max(20) {
+            return Err(Error::RustError(
+                "Failed to generate unique short code".into(),
+            ));
+        }
+    }
+}
 
 #[utoipa::path(
     post,
@@ -211,6 +270,13 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
         return Response::error(error_msg, 403);
     }
 
+    let min_random_length = crate::db::queries::get_min_random_code_length(&db).await?;
+    let min_custom_length = crate::db::queries::get_min_custom_code_length(&db).await?;
+    let system_min_length = crate::db::queries::get_system_min_code_length(&db).await?;
+
+    // Custom codes must respect the higher of the custom rule or system physical floor
+    let effective_custom_min = min_custom_length.max(system_min_length);
+
     let kv = ctx.kv("URL_MAPPINGS")?;
 
     let short_code = if let Some(custom_code) = body.short_code {
@@ -221,24 +287,24 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
             }
         };
 
-        if kv::links::short_code_exists(&kv, &custom_code).await? {
+        if custom_code.len() < effective_custom_min {
+            return Response::error(
+                format!(
+                    "Custom short code must be at least {} characters",
+                    effective_custom_min
+                ),
+                400,
+            );
+        }
+
+        if crate::kv::links::short_code_exists(&kv, &custom_code).await? {
             return Response::error("Short code already in use", 409);
         }
 
         custom_code
     } else {
-        let mut code = generate_short_code();
-        let mut attempts = 0;
-
-        while kv::links::short_code_exists(&kv, &code).await? {
-            code = generate_short_code();
-            attempts += 1;
-            if attempts > 10 {
-                return Response::error("Failed to generate unique short code", 500);
-            }
-        }
-
-        code
+        generate_progressive_short_code(&kv, &db, &ctx.env, min_random_length, system_min_length)
+            .await?
     };
 
     let normalized_tags = if let Some(tags) = body.tags {

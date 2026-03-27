@@ -1,5 +1,5 @@
-<script lang="ts">
-  import { linksApi, tagsApi } from "$lib/api/links";
+e<script lang="ts">
+	import { linksApi, tagsApi } from "$lib/api/links";
   import TagInput from "$lib/components/TagInput.svelte";
   import type {
     Link,
@@ -9,18 +9,23 @@
     UtmParams
   } from "$lib/types/api";
   import { debounce, fetchUrlTitle } from "$lib/utils/url-title";
+  import { DEFAULT_MIN_CUSTOM_CODE_LENGTH, MAX_SHORT_CODE_LENGTH } from "$lib/constants";
   import { createEventDispatcher, onMount } from "svelte";
 
   interface Props {
     link?: Link | null;
     isOpen?: boolean;
     usage?: UsageResponse | null;
+    minShortCodeLength?: number;
+    maxShortCodeLength?: number;
   }
 
   let {
     link = null,
     isOpen = $bindable(false),
-    usage = null
+    usage = null,
+    minShortCodeLength = DEFAULT_MIN_CUSTOM_CODE_LENGTH,
+    maxShortCodeLength = MAX_SHORT_CODE_LENGTH
   }: Props = $props();
 
   const dispatch = createEventDispatcher<{ saved: Link }>();
@@ -404,11 +409,11 @@
           />
         </div>
 
-        <!-- Short Code -->
+				<!-- Short Code -->
         <div>
           <label
             for="short-code"
-            class="block text-sm font-medium text-gray-700 mb-2 flex items-center gap-2"
+            class="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2"
           >
             {#if isEditMode}
               Short Code (Read-only)
@@ -436,6 +441,8 @@
             type="text"
             bind:value={shortCode}
             disabled={isEditMode || loading || !allowCustomShortCode}
+            minlength={minShortCodeLength}
+            maxlength={maxShortCodeLength}
             placeholder={isEditMode
               ? ""
               : allowCustomShortCode
@@ -453,7 +460,7 @@
                 >Upgrade to Pro</a
               > to use custom short codes
             {:else}
-              3-100 characters (letters, numbers, hyphens, forward slashes).
+              {minShortCodeLength}-{maxShortCodeLength} characters (letters, numbers, hyphens, forward slashes).
               Leave empty for auto-generated code
             {/if}
           </p>
@@ -506,43 +513,47 @@
           {/if}
         </div>
 
-        <!-- Redirect Type -->
-        <div>
-          <label
-            for="redirect-type"
-            class="block text-sm font-medium text-gray-700 mb-2 flex items-center gap-2"
-          >
-            Redirect Type
-            {#if !isProOrAbove}
-              <span
-                class="px-2 py-0.5 text-xs font-medium bg-orange-100 text-orange-700 rounded-full"
-                >Pro</span
-              >
-            {/if}
-          </label>
-          <select
-            id="redirect-type"
-            bind:value={redirectType}
-            disabled={loading || !isProOrAbove}
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
-          >
-            <option value="301">301 - Permanent (SEO Optimized)</option>
-            {#if isProOrAbove}
-              <option value="307">307 - Temporary (Better Tracking)</option>
-            {/if}
-          </select>
-          <p class="text-xs text-gray-500 mt-1">
-            {#if !isProOrAbove}
-              <a
-                href="/pricing"
-                class="text-orange-600 hover:text-orange-700 hover:underline"
-                >Upgrade to Pro</a
-              > to use temporary redirects (307)
-            {:else}
-              301 for SEO benefits, 307 to avoid browser caching
-            {/if}
-          </p>
-        </div>
+				<!-- Redirect Type -->
+				<div>
+					<label
+						for="redirect-type"
+						class="text-sm font-medium text-gray-700 mb-2 flex items-center gap-2"
+					>
+						Redirect Type
+						{#if !isProOrAbove}
+							<span
+								class="px-2 py-0.5 text-xs font-medium bg-orange-100 text-orange-700 rounded-full"
+								>Pro</span
+							>
+						{/if}
+					</label>
+					<select
+						id="redirect-type"
+						bind:value={redirectType}
+						disabled={loading || !isProOrAbove}
+						class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
+					>
+						<option value="301"
+							>301 - Permanent (SEO Optimized)</option
+						>
+						{#if isProOrAbove}
+							<option value="307"
+								>307 - Temporary (Better Tracking)</option
+							>
+						{/if}
+					</select>
+					<p class="text-xs text-gray-500 mt-1">
+						{#if !isProOrAbove}
+							<a
+								href="/pricing"
+								class="text-orange-600 hover:text-orange-700 hover:underline"
+								>Upgrade to Pro</a
+							> to use temporary redirects (307)
+						{:else}
+							301 for SEO benefits, 307 to avoid browser caching
+						{/if}
+					</p>
+				</div>
 
         <!-- Expiration Date -->
         <div>
@@ -649,7 +660,7 @@
                     <!-- Source -->
                     <div class="flex items-center gap-3">
                       <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0"
                       >
                         <svg
                           class="w-4 h-4 text-gray-600"
@@ -667,7 +678,7 @@
                       </div>
                       <label
                         for="modal-utm-source"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                        class="text-sm font-medium text-gray-700 w-20 shrink-0"
                         >Source</label
                       >
                       <input
@@ -683,7 +694,7 @@
                     <!-- Medium -->
                     <div class="flex items-center gap-3">
                       <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0"
                       >
                         <svg
                           class="w-4 h-4 text-gray-600"
@@ -701,7 +712,7 @@
                       </div>
                       <label
                         for="modal-utm-medium"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                        class="text-sm font-medium text-gray-700 w-20 shrink-0"
                         >Medium</label
                       >
                       <input
@@ -717,7 +728,7 @@
                     <!-- Campaign -->
                     <div class="flex items-center gap-3">
                       <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0"
                       >
                         <svg
                           class="w-4 h-4 text-gray-600"
@@ -741,7 +752,7 @@
                       </div>
                       <label
                         for="modal-utm-campaign"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                        class="text-sm font-medium text-gray-700 w-20 shrink-0"
                         >Campaign</label
                       >
                       <input
@@ -757,7 +768,7 @@
                     <!-- Term -->
                     <div class="flex items-center gap-3">
                       <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0"
                       >
                         <svg
                           class="w-4 h-4 text-gray-600"
@@ -775,7 +786,7 @@
                       </div>
                       <label
                         for="modal-utm-term"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                        class="text-sm font-medium text-gray-700 w-20 shrink-0"
                         >Term</label
                       >
                       <input
@@ -791,7 +802,7 @@
                     <!-- Content -->
                     <div class="flex items-center gap-3">
                       <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0"
                       >
                         <svg
                           class="w-4 h-4 text-gray-600"
@@ -809,7 +820,7 @@
                       </div>
                       <label
                         for="modal-utm-content"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                        class="text-sm font-medium text-gray-700 w-20 shrink-0"
                         >Content</label
                       >
                       <input
@@ -825,7 +836,7 @@
                     <!-- Ref -->
                     <div class="flex items-center gap-3">
                       <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0"
                       >
                         <svg
                           class="w-4 h-4 text-gray-600"
@@ -843,7 +854,7 @@
                       </div>
                       <label
                         for="modal-utm-ref"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                        class="text-sm font-medium text-gray-700 w-20 shrink-0"
                         >Referral</label
                       >
                       <input
@@ -970,7 +981,7 @@
           <button
             type="submit"
             disabled={loading}
-            class="flex-1 px-6 py-3 bg-gradient-to-r from-orange-500 to-orange-600 text-white rounded-lg font-semibold hover:from-orange-600 hover:to-orange-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
+            class="flex-1 px-6 py-3 bg-linear-to-r from-orange-500 to-orange-600 text-white rounded-lg font-semibold hover:from-orange-600 hover:to-orange-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {loading
               ? "Saving..."
