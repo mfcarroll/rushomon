@@ -3383,7 +3383,10 @@ pub async fn upsert_subscription(
     ends_at: Option<i64>,
     now: i64,
 ) -> Result<()> {
-    let sub_id = format!("sub_{}", crate::utils::generate_short_code_with_length(16));
+    let sub_id = format!(
+        "sub_{}",
+        crate::utils::generate_short_code_with_length(16, false)
+    );
     let cancel_flag: i64 = if cancel_at_period_end { 1 } else { 0 };
 
     let stmt = db.prepare(

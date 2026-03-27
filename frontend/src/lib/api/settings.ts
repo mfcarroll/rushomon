@@ -18,6 +18,7 @@ export interface PublicSettings {
     min_random_code_length: number;
     min_custom_code_length: number;
     system_min_code_length: number;
+    exclude_ambiguous_chars: string;
     active_discount_amount_pro_monthly: number;
     active_discount_amount_pro_annual: number;
     active_discount_amount_business_monthly: number;
