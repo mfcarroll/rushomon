@@ -313,6 +313,7 @@ async fn generate_progressive_short_code(
     env: &Env,
     admin_min_length: usize,
     system_min_length: usize,
+    exclude_ambiguous: bool,
 ) -> Result<String> {
     // Move the parsing logic here!
     let collision_threshold = env
@@ -326,7 +327,7 @@ async fn generate_progressive_short_code(
     let mut current_length_attempts = 0;
 
     loop {
-        let code = generate_short_code_with_length(current_length);
+        let code = generate_short_code_with_length(current_length, exclude_ambiguous);
 
         if !kv::links::short_code_exists(kv, &code).await? {
             return Ok(code);
@@ -573,6 +574,11 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_SYSTEM_MIN_CODE_LENGTH);
 
+    let exclude_ambiguous = settings
+        .get("exclude_ambiguous_chars")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     // Custom codes must respect the higher of the custom rule or system physical floor
     let effective_custom_min = min_custom_length.max(system_min_length);
 
@@ -605,8 +611,15 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
     } else {
         // Generate random code and check for collisions (very rare)
         let kv = ctx.kv("URL_MAPPINGS")?;
-        generate_progressive_short_code(&kv, &db, &ctx.env, min_random_length, system_min_length)
-            .await?
+        generate_progressive_short_code(
+            &kv,
+            &db,
+            &ctx.env,
+            min_random_length,
+            system_min_length,
+            exclude_ambiguous,
+        )
+        .await?
     };
 
     // Validate and normalize tags if provided
@@ -1525,6 +1538,11 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_SYSTEM_MIN_CODE_LENGTH);
 
+    let exclude_ambiguous = settings
+        .get("exclude_ambiguous_chars")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let effective_custom_min = min_custom_length.max(system_min_length);
 
     let mut created: usize = 0;
@@ -1633,6 +1651,7 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
                         &ctx.env,
                         min_length,
                         system_min_length,
+                        exclude_ambiguous,
                     )
                     .await
                     {
@@ -1662,8 +1681,15 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
             }
         } else {
             // Free tier OR Pro without provided code: auto-generate using progressive helper
-            match generate_progressive_short_code(&kv, &db, &ctx.env, min_length, system_min_length)
-                .await
+            match generate_progressive_short_code(
+                &kv,
+                &db,
+                &ctx.env,
+                min_length,
+                system_min_length,
+                exclude_ambiguous,
+            )
+            .await
             {
                 Ok(c) => short_code = c,
                 Err(_) => {

@@ -56,7 +56,7 @@ pub async fn handle_create_api_key(mut req: Request, ctx: RouteContext<()>) -> R
     let expires_at = body.expires_in_days.map(|days| now + (days * 24 * 60 * 60));
 
     // Generate the raw token (prefix + 32 random chars)
-    let raw_token = format!("ro_pat_{}", generate_short_code_with_length(32));
+    let raw_token = format!("ro_pat_{}", generate_short_code_with_length(32, false));
 
     // Generate the hint (prefix + last 4 chars)
     let hint = format!("ro_pat_...{}", &raw_token[raw_token.len() - 4..]);

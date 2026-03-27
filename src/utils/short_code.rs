@@ -1,6 +1,8 @@
 use rand::RngExt;
 
 const BASE62_CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+// Standard Flickr Base58 Alphabet (no 0, O, I, or l)
+const BASE58_CHARS: &[u8] = b"123456789abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ";
 
 /// Character set: 0-9, A-Z, a-z (62 chars)
 /// Combinations: 62^6 = 56,800,235,584 (56.8 billion)
@@ -11,18 +13,24 @@ pub const DEFAULT_SYSTEM_MIN_CODE_LENGTH: usize = 1;
 pub const MAX_SHORT_CODE_LENGTH: usize = 100;
 pub const DEFAULT_COLLISION_THRESHOLD: usize = 3;
 
-/// Generate a random base62 short code
+/// Generate a random short code (defaults to Base62)
 pub fn generate_short_code() -> String {
-    generate_short_code_with_length(DEFAULT_MIN_RANDOM_CODE_LENGTH)
+    generate_short_code_with_length(DEFAULT_MIN_RANDOM_CODE_LENGTH, false)
 }
 
-/// Generate a random base62 short code with custom length
-pub fn generate_short_code_with_length(length: usize) -> String {
+/// Generate a random short code with custom length, optionally excluding ambiguous characters
+pub fn generate_short_code_with_length(length: usize, exclude_ambiguous: bool) -> String {
     let mut rng = rand::rng();
+    let charset = if exclude_ambiguous {
+        BASE58_CHARS
+    } else {
+        BASE62_CHARS
+    };
+
     (0..length)
         .map(|_| {
-            let idx = rng.random_range(0..BASE62_CHARS.len());
-            BASE62_CHARS[idx] as char
+            let idx = rng.random_range(0..charset.len());
+            charset[idx] as char
         })
         .collect()
 }
@@ -82,5 +90,29 @@ mod tests {
         assert_ne!(code1, code2);
         assert_ne!(code2, code3);
         assert_ne!(code1, code3);
+    }
+
+    #[test]
+    fn test_generate_base58_excludes_ambiguous_chars() {
+        // Generate 100 codes at 20 characters long to ensure a massive sample size
+        for _ in 0..100 {
+            let code = generate_short_code_with_length(20, true);
+
+            // Mathematically guarantee these characters never appear
+            assert!(!code.contains('0'), "Generated code contained a zero!");
+            assert!(!code.contains('O'), "Generated code contained a capital O!");
+            assert!(!code.contains('I'), "Generated code contained a capital I!");
+            assert!(
+                !code.contains('l'),
+                "Generated code contained a lowercase l!"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generate_base62_normal() {
+        // Just verify the default generator still works and produces the right length
+        let code = generate_short_code_with_length(10, false);
+        assert_eq!(code.len(), 10);
     }
 }
