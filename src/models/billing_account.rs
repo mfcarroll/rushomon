@@ -35,6 +35,9 @@ impl BillingAccount {
 
     /// Generate a new billing account ID
     pub fn generate_id() -> String {
-        format!("ba_{}", crate::utils::generate_short_code_with_length(16))
+        format!(
+            "ba_{}",
+            crate::utils::generate_short_code_with_length(16, false)
+        )
     }
 }
