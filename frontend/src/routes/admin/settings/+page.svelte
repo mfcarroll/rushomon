@@ -75,6 +75,9 @@
 	let minCustomCodeLength = $state(DEFAULT_MIN_CUSTOM_CODE_LENGTH);
 	let systemMinCodeLength = $state(DEFAULT_SYSTEM_MIN_CODE_LENGTH);
 
+	// Ambiguous characters setting
+	let excludeAmbiguousChars = $state(false);
+
 	// Filter discounts for a specific product
 	function getDiscountsForSlot(slot: keyof typeof PRODUCT_IDS): Discount[] {
 		const productId = PRODUCT_IDS[slot];
@@ -143,6 +146,9 @@
 				systemMinCodeLength, 
 				parseInt(settings.min_custom_code_length || DEFAULT_MIN_CUSTOM_CODE_LENGTH.toString())
 			);
+
+			// Load ambiguous characters setting
+			excludeAmbiguousChars = settings.exclude_ambiguous_chars === "true";
 			
 			founderPricingEnabled = settings.founder_pricing_active === "true";
 			discountSlots.pro_monthly =
@@ -498,6 +504,13 @@
 		}
 	}
 
+	async function handleExcludeAmbiguousToggle() {
+		const newValue = !excludeAmbiguousChars;
+		// Optimistic update for a snappy UI
+		excludeAmbiguousChars = newValue;
+		await handleUpdateSetting("exclude_ambiguous_chars", newValue ? "true" : "false");
+	}
+
 	async function handleUpdateSetting(key: string, value: string) {
 		try {
 			saving = true;
@@ -635,6 +648,30 @@
 					</div>
 				</div>
 			</div>
+
+			<!-- Ambiguous characters setting -->
+			<div class="setting-card">
+                <div class="setting-content">
+                    <div class="setting-info">
+                        <h3>Exclude ambiguous characters</h3>
+                        <p class="setting-description">
+                            Removes visually similar characters <code>(0, O, I, l)</code> from generated random codes to reduce typos.
+                        </p>
+                    </div>
+                    <div class="setting-control">
+                        <button
+                            onclick={handleExcludeAmbiguousToggle}
+                            disabled={saving}
+                            class="toggle-switch {excludeAmbiguousChars ? 'enabled' : 'disabled'}"
+                            role="switch"
+                            aria-checked={excludeAmbiguousChars}
+                            aria-label="Toggle ambiguous characters"
+                        >
+                            <span class="toggle-slider"></span>
+                        </button>
+                    </div>
+                </div>
+            </div>
 
 			<!-- Pricing Section -->
 			<div class="pricing-section">
@@ -1716,6 +1753,17 @@
 		box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
 		z-index: 1001;
 		animation: slideIn 0.3s ease;
+	}
+
+	/* Code */
+	.setting-description code {
+		background-color: #f1f5f9; /* Tailwind slate-100 */
+		padding: 0.125rem 0.375rem;
+		border-radius: 4px;
+		border: 1px solid #e2e8f0; /* Tailwind slate-200 */
+		font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+		font-size: 0.8em;
+		color: #334155; /* Tailwind slate-700 */
 	}
 
 	@keyframes slideIn {
