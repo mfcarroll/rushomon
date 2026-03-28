@@ -2882,6 +2882,14 @@ pub async fn handle_admin_update_setting(
                 );
             }
         }
+        "exclude_ambiguous_chars" => {
+            if value != "true" && value != "false" {
+                return Response::error(
+                    "Invalid value for 'exclude_ambiguous_chars'. Must be 'true' or 'false'",
+                    400,
+                );
+            }
+        }
         _ => return Response::error(format!("Unknown setting: {}", key), 400),
     }
 
