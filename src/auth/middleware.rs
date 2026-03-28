@@ -165,15 +165,35 @@ pub async fn authenticate_request(
             return Err(AuthError::Forbidden("Account suspended".to_string()));
         }
 
+        let _pat_org_member =
+            match crate::db::queries::get_org_member(
+                &db,
+                &api_key_with_tier.org_id,
+                &api_key_with_tier.user_id,
+            )
+            .await
+            {
+                Ok(Some(m)) => m,
+                Ok(None) => return Err(AuthError::Unauthorized(
+                    "You are no longer a member of the organization associated with this API key."
+                        .to_string(),
+                )),
+                Err(_) => {
+                    return Err(AuthError::InternalError(
+                        "Failed to validate organization membership".to_string(),
+                    ));
+                }
+            };
+
         // 7. Update the 'last_used_at' timestamp
         let _ = crate::db::queries::update_api_key_last_used(
             &db,
             &api_key_with_tier.user_id,
-            now_timestamp(),
+            crate::utils::time::now_timestamp(),
         )
         .await;
 
-        // 6. Successfully authenticate!
+        // 8. Successfully authenticate!
         return Ok(UserContext {
             user_id: user.id,
             org_id: api_key_with_tier.org_id,
@@ -348,10 +368,35 @@ pub async fn authenticate_request(
         return Err(AuthError::Forbidden("Account suspended".to_string()));
     }
 
+    let _org_member =
+        match crate::db::queries::get_org_member(&db, &session.org_id, &session.user_id).await {
+            Ok(Some(member)) => member,
+            Ok(None) => {
+                worker::console_log!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "auth_user_not_in_org",
+                        "user_id": session.user_id,
+                        "org_id": session.org_id,
+                        "level": "warn"
+                    })
+                );
+                return Err(AuthError::Unauthorized(
+                    "You are no longer a member of this organization.".to_string(),
+                ));
+            }
+            Err(_) => {
+                return Err(AuthError::InternalError(
+                    "Failed to validate organization membership".to_string(),
+                ));
+            }
+        };
+    // ----------------------------------------------
+
     Ok(UserContext {
         user_id: session.user_id,
         org_id: session.org_id,
         session_id: claims.session_id,
-        role: claims.role,
+        role: user.role,
     })
 }

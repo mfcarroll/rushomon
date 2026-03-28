@@ -1,4 +1,5 @@
 pub mod crypto;
+pub mod dns;
 pub mod email;
 pub mod short_code;
 pub mod time;
