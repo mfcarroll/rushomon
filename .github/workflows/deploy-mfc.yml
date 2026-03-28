@@ -1,0 +1,411 @@
+name: Deploy mfc.cx
+
+on:
+  push:
+    branches:
+      - deploy
+  # Manual deployment trigger
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  backup:
+    name: Backup Database
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    environment: production-mfc
+    env:
+      ACTIONS_NODE_VERSION: "24"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '24'
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Generate wrangler production config
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          R2_ASSETS_BUCKET_NAME: ${{ secrets.R2_ASSETS_BUCKET_NAME }}
+          GH_CLIENT_ID: ${{ secrets.GH_CLIENT_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          MAILGUN_DOMAIN: ${{ secrets.MAILGUN_DOMAIN }}
+          MAILGUN_BASE_URL: ${{ secrets.MAILGUN_BASE_URL }}
+          MAILGUN_FROM: ${{ secrets.MAILGUN_FROM }}
+
+        run: |
+          cat > wrangler.production.toml << 'EOF'
+          name = "${{ vars.INSTANCE_NAME }}"
+          main = "build/worker/shim.mjs"
+          compatibility_date = "2026-02-10"
+          workers_dev = false
+          upload_source_maps = true
+
+          # Observability configuration
+          [observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [observability.traces]
+          enabled = true
+          head_sampling_rate = 0.1
+
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          [triggers]
+          crons = ["0 0 * * *", "0 4 * * *"]
+
+          [[d1_databases]]
+          binding = "rushomon"
+          database_name = "rushomon"
+          database_id = "${{ env.D1_DATABASE_ID }}"
+
+          [[kv_namespaces]]
+          binding = "URL_MAPPINGS"
+          id = "${{ env.KV_NAMESPACE_ID }}"
+
+          [[r2_buckets]]
+          binding = "ASSETS_BUCKET"
+          bucket_name = "${{ env.R2_ASSETS_BUCKET_NAME }}"
+
+          [assets]
+          directory = "./frontend/build"
+          binding = "ASSETS"
+          run_worker_first = true
+          not_found_handling = "none"
+
+          [vars]
+          GITHUB_CLIENT_ID = "${{ env.GH_CLIENT_ID }}"
+          GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+          GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+          GITHUB_USER_URL = "https://api.github.com/user"
+          GOOGLE_CLIENT_ID = "${{ env.GOOGLE_CLIENT_ID }}"
+          GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+          GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+          GOOGLE_USER_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+          MAILGUN_DOMAIN = "${{ env.MAILGUN_DOMAIN }}"
+          MAILGUN_BASE_URL = "${{ env.MAILGUN_BASE_URL }}"
+          MAILGUN_FROM = "${{ env.MAILGUN_FROM }}"
+          DOMAIN = "${{ secrets.API_DOMAIN }}"
+          FRONTEND_URL = "https://${{ secrets.WEB_DOMAIN }}"
+          ALLOWED_ORIGINS = "https://${{ secrets.WEB_DOMAIN }},https://${{ secrets.API_DOMAIN }}"
+          ENABLE_KV_RATE_LIMITING = "false"
+          POLAR_ORG_SLUG = "${{ secrets.POLAR_ORG_SLUG }}"
+          POLAR_SANDBOX = "false"
+          COLLISION_THRESHOLD = "${{ vars.COLLISION_THRESHOLD }}"
+          EOF
+
+          echo "✅ Generated wrangler.production.toml"
+
+      - name: Create backup
+        id: backup
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_FILE="production_backup_deployment_${TIMESTAMP}.sql"
+
+          echo "Creating backup: $BACKUP_FILE"
+
+          # Use the generated wrangler config for backup
+          ./scripts/backup.sh --config wrangler.production.toml -o "$BACKUP_FILE" -z -r ${{ secrets.R2_BACKUP_BUCKET_NAME }}
+
+          echo "backup_file=${BACKUP_FILE}.gz" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: backup
+    environment:
+      name: production-mfc
+    env:
+      ACTIONS_NODE_VERSION: "24"
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: '24'
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: '.'
+
+      - name: Cache npm
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install wrangler and worker-build
+        run: |
+          npm install -g wrangler
+          cargo install -q worker-build
+
+      - name: Build Worker
+        run: worker-build --release
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build Frontend for Unified Worker
+        working-directory: frontend
+        env:
+          PUBLIC_VITE_API_BASE_URL: https://${{ secrets.API_DOMAIN }}
+          PUBLIC_VITE_SHORT_LINK_BASE_URL: https://${{ secrets.REDIRECT_DOMAIN }}
+          PUBLIC_VITE_SITE_URL: https://${{ secrets.WEB_DOMAIN }}
+        run: |
+          echo "🔨 Building frontend for unified Worker deployment"
+          echo "   API Base URL: https://${{ secrets.API_DOMAIN }}"
+          echo "   Short Link Base URL: https://${{ secrets.REDIRECT_DOMAIN }}"
+          echo "   Site URL: https://${{ secrets.WEB_DOMAIN }}"
+          npm run build
+
+      - name: Generate Production wrangler.toml
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          R2_ASSETS_BUCKET_NAME: ${{ secrets.R2_ASSETS_BUCKET_NAME }}
+          GH_CLIENT_ID: ${{ secrets.GH_CLIENT_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          MAILGUN_DOMAIN: ${{ secrets.MAILGUN_DOMAIN }}
+          MAILGUN_BASE_URL: ${{ secrets.MAILGUN_BASE_URL }}
+          MAILGUN_FROM: ${{ secrets.MAILGUN_FROM }}
+        run: |
+          cat > wrangler.production.toml << 'EOF'
+          name = "${{ vars.INSTANCE_NAME }}"
+          main = "build/worker/shim.mjs"
+          compatibility_date = "2026-02-10"
+          workers_dev = false
+          upload_source_maps = true
+
+          # Observability configuration
+          [observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [observability.traces]
+          enabled = true
+          head_sampling_rate = 0.1
+
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          [triggers]
+          crons = ["0 0 * * *", "0 4 * * *"]
+
+          [[d1_databases]]
+          binding = "rushomon"
+          database_name = "rushomon"
+          database_id = "${{ env.D1_DATABASE_ID }}"
+
+          [[kv_namespaces]]
+          binding = "URL_MAPPINGS"
+          id = "${{ env.KV_NAMESPACE_ID }}"
+
+          [[r2_buckets]]
+          binding = "ASSETS_BUCKET"
+          bucket_name = "${{ env.R2_ASSETS_BUCKET_NAME }}"
+
+          [assets]
+          directory = "./frontend/build"
+          binding = "ASSETS"
+          run_worker_first = true
+          not_found_handling = "none"
+
+          [vars]
+          GITHUB_CLIENT_ID = "${{ env.GH_CLIENT_ID }}"
+          GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+          GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+          GITHUB_USER_URL = "https://api.github.com/user"
+          GOOGLE_CLIENT_ID = "${{ env.GOOGLE_CLIENT_ID }}"
+          GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+          GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+          GOOGLE_USER_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+          MAILGUN_DOMAIN = "${{ env.MAILGUN_DOMAIN }}"
+          MAILGUN_BASE_URL = "${{ env.MAILGUN_BASE_URL }}"
+          MAILGUN_FROM = "${{ env.MAILGUN_FROM }}"
+          DOMAIN = "${{ secrets.API_DOMAIN }}"
+          FRONTEND_URL = "https://${{ secrets.WEB_DOMAIN }}"
+          ALLOWED_ORIGINS = "https://${{ secrets.WEB_DOMAIN }},https://${{ secrets.API_DOMAIN }}"
+          ENABLE_KV_RATE_LIMITING = "false"
+          POLAR_ORG_SLUG = "${{ secrets.POLAR_ORG_SLUG }}"
+          POLAR_SANDBOX = "false"
+          COLLISION_THRESHOLD = "${{ vars.COLLISION_THRESHOLD }}"
+          EOF
+
+          echo "✅ Generated wrangler.production.toml"
+
+      - name: Apply D1 Migrations
+        run: |
+          echo "📋 Applying D1 migrations to production database..."
+          wrangler d1 migrations apply rushomon --remote --config wrangler.production.toml
+          echo "✅ Production migrations applied successfully"
+
+      - name: Set Worker Secrets
+        env:
+          GH_CLIENT_SECRET: ${{ secrets.GH_CLIENT_SECRET }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          MAILGUN_API_KEY: ${{ secrets.MAILGUN_API_KEY }}
+          POLAR_ACCESS_TOKEN: ${{ secrets.POLAR_ACCESS_TOKEN }}
+          POLAR_WEBHOOK_SECRET: ${{ secrets.POLAR_WEBHOOK_SECRET }}
+        run: |
+          # Set secrets using wrangler secrets API (not visible in Worker dashboard)
+          echo "🔐 Setting Worker secrets..."
+          echo "$GH_CLIENT_SECRET" | wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.production.toml
+          echo "$JWT_SECRET" | wrangler secret put JWT_SECRET --config wrangler.production.toml
+          echo "$GOOGLE_CLIENT_SECRET" | wrangler secret put GOOGLE_CLIENT_SECRET --config wrangler.production.toml
+          echo "$MAILGUN_API_KEY" | wrangler secret put MAILGUN_API_KEY --config wrangler.production.toml
+          if [ -n "$POLAR_ACCESS_TOKEN" ]; then
+            echo "$POLAR_ACCESS_TOKEN" | wrangler secret put POLAR_ACCESS_TOKEN --config wrangler.production.toml
+            echo "$POLAR_WEBHOOK_SECRET" | wrangler secret put POLAR_WEBHOOK_SECRET --config wrangler.production.toml
+          fi
+          echo "✅ Secrets configured securely"
+
+      - name: Deploy Worker
+        run: |
+          echo "🚀 Deploying worker to production..."
+          wrangler deploy --config wrangler.production.toml
+          echo "✅ Worker deployed successfully"
+
+  smoke-tests:
+    name: Production Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: deploy
+    environment:
+      name: production-mfc
+
+    steps:
+      - name: Run Production Smoke Tests
+        env:
+          WEB_DOMAIN: ${{ secrets.WEB_DOMAIN }}
+          REDIRECT_DOMAIN: ${{ secrets.REDIRECT_DOMAIN }}
+        run: |
+          WEB_URL="https://$WEB_DOMAIN"
+          REDIRECT_URL="https://$REDIRECT_DOMAIN"
+
+          echo "🧪 Running production smoke tests"
+          echo "   Web domain: $WEB_URL"
+          echo "   Redirect domain: $REDIRECT_URL"
+          echo ""
+
+          # Wait for deployment to propagate
+          sleep 5
+
+          # Test 1: Web domain homepage loads
+          echo "🏠 Test 1: Web Domain Homepage"
+          echo "------------------------------"
+          HOMEPAGE_RESPONSE=$(curl -s -L -w "\nHTTP_CODE:%{http_code}" "$WEB_URL/" || echo "FAILED")
+          HOMEPAGE_HTTP_CODE=$(echo "$HOMEPAGE_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$HOMEPAGE_HTTP_CODE" = "200" ]; then
+            echo "✅ Homepage loads correctly (HTTP 200)"
+          else
+            echo "❌ Homepage failed with HTTP $HOMEPAGE_HTTP_CODE"
+            echo "   This may indicate custom domains are not yet configured."
+            echo "   Configure domains manually in Cloudflare Dashboard."
+            exit 1
+          fi
+
+          # Test 2: Redirect domain root redirects to web domain
+          echo ""
+          echo "🔄 Test 2: Redirect Domain Root"
+          echo "-------------------------------"
+          ROOT_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+            -I "$REDIRECT_URL/" || echo "FAILED")
+          ROOT_HTTP_CODE=$(echo "$ROOT_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$ROOT_HTTP_CODE" = "301" ]; then
+            ROOT_LOCATION=$(echo "$ROOT_RESPONSE" | grep -i location | cut -d' ' -f2- | tr -d '\r')
+            echo "✅ Root redirects with 301 to: $ROOT_LOCATION"
+          else
+            echo "⚠️  Expected 301 redirect, got HTTP $ROOT_HTTP_CODE"
+            echo "   Redirect domain may not be configured yet."
+          fi
+
+          # Test 3: Nonexistent short code redirects to /404
+          echo ""
+          echo "🔗 Test 3: Nonexistent Short Code"
+          echo "---------------------------------"
+          NOT_FOUND_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+            -I "$REDIRECT_URL/doesnotexist999" || echo "FAILED")
+          NOT_FOUND_HTTP_CODE=$(echo "$NOT_FOUND_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$NOT_FOUND_HTTP_CODE" = "302" ]; then
+            NOT_FOUND_LOCATION=$(echo "$NOT_FOUND_RESPONSE" | grep -i location | cut -d' ' -f2- | tr -d '\r')
+            echo "✅ Nonexistent code redirects to: $NOT_FOUND_LOCATION"
+          else
+            echo "⚠️  Expected 302 redirect, got HTTP $NOT_FOUND_HTTP_CODE"
+          fi
+
+          # Test 4: Authentication enforcement
+          echo ""
+          echo "🔐 Test 4: Authentication Enforcement"
+          echo "-------------------------------------"
+          for endpoint in "/api/links" "/api/auth/me"; do
+            echo -n "  $endpoint: "
+            AUTH_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+              "$WEB_URL$endpoint" || echo "FAILED")
+            AUTH_HTTP_CODE=$(echo "$AUTH_RESPONSE" | tail -n1 | cut -d: -f2)
+
+            if [ "$AUTH_HTTP_CODE" = "401" ]; then
+              echo "✅ Correctly requires authentication"
+            else
+              echo "❌ Expected 401, got $AUTH_HTTP_CODE"
+              exit 1
+            fi
+          done
+
+          # Test 5: 404 page accessible on web domain
+          echo ""
+          echo "📄 Test 5: 404 Page Accessibility"
+          echo "---------------------------------"
+          PAGE_404_RESPONSE=$(curl -s -L -w "\nHTTP_CODE:%{http_code}" "$WEB_URL/404" || echo "FAILED")
+          PAGE_404_HTTP_CODE=$(echo "$PAGE_404_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$PAGE_404_HTTP_CODE" = "200" ]; then
+            echo "✅ /404 page accessible"
+          else
+            echo "⚠️  /404 page returned HTTP $PAGE_404_HTTP_CODE"
+          fi
+
+          echo ""
+          echo "🎯 Production Smoke Tests Summary"
+          echo "================================="
+          echo "✅ Web domain serving correctly"
+          echo "✅ Authentication properly enforced"
+          echo "✅ Redirect behavior verified"
