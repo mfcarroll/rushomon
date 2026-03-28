@@ -314,6 +314,17 @@ export interface OrgDetails {
 	pending_invitations: OrgInvitation[];
 }
 
+export interface OrgDomain {
+    id: string;
+    org_id: string;
+    domain: string;
+    verification_method: string;
+    verification_token?: string;
+    is_verified: boolean;
+    created_at: number;
+    verified_at?: number;
+}
+
 export interface InviteInfo {
 	valid: boolean;
 	reason?: string;

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Header from "$lib/components/Header.svelte";
+	import OrgDomains from "$lib/components/OrgDomains.svelte";
 	import { orgsApi } from "$lib/api/orgs";
 	import { billingApi } from "$lib/api/billing";
 	import { apiClient } from "$lib/api/client";

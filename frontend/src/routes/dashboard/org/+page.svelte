@@ -14,6 +14,7 @@
 	} from "$lib/types/api";
 	import type { BillingStatus } from "$lib/api/billing";
 	import LoadingButton from "$lib/components/LoadingButton.svelte";
+	import OrgDomains from "$lib/components/OrgDomains.svelte";
 
 	let { data }: { data: PageData } = $props();
 
@@ -21,6 +22,11 @@
 	let loading = $state(true);
 	let error = $state("");
 	let billingStatus = $state<BillingStatus | null>(null);
+
+	let isBusinessTier = $derived(
+        orgDetails?.org?.tier === 'business' || 
+        orgDetails?.org?.tier === 'unlimited'
+    );
 
 	// Rename org
 	let editingName = $state(false);
@@ -918,6 +924,11 @@
 						{/if}
 					{/if}
 				</div>
+			{/if}
+
+			<!-- Domain verification (owner only)-->
+			{#if isOwner && isBusinessTier}
+				<OrgDomains orgId={orgDetails.org.id} />
 			{/if}
 
 			<!-- Plan & Billing -->
