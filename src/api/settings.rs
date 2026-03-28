@@ -45,6 +45,11 @@ pub async fn handle_get_public_settings(
     let effective_min_random = raw_min_random.max(system_min);
     let effective_min_custom = raw_min_custom.max(system_min);
 
+    let exclude_ambiguous = settings
+        .get("exclude_ambiguous_chars")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     Response::from_json(&serde_json::json!({
         "founder_pricing_active": founder_pricing_active,
         "min_random_code_length": effective_min_random,
@@ -54,5 +59,6 @@ pub async fn handle_get_public_settings(
         "active_discount_amount_pro_annual": get_setting_i64("active_discount_amount_pro_annual", 0),
         "active_discount_amount_business_monthly": get_setting_i64("active_discount_amount_business_monthly", 0),
         "active_discount_amount_business_annual": get_setting_i64("active_discount_amount_business_annual", 0),
+        "exclude_ambiguous_chars": exclude_ambiguous,
     }))
 }
