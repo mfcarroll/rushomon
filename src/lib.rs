@@ -363,6 +363,9 @@ async fn main(req: Request, env: Env, worker_ctx: Context) -> Result<Response> {
         )
         .options_async("/api/orgs/:id/settings", handle_cors_preflight)
         .options_async("/api/orgs/:id/logo", handle_cors_preflight)
+        .options_async("/api/orgs/:id/domains", handle_cors_preflight)
+        .options_async("/api/orgs/:id/domains/:domain", handle_cors_preflight)
+        .options_async("/api/orgs/:id/verify-domain", handle_cors_preflight)
         .options_async("/api/auth/switch-org", handle_cors_preflight)
         .options_async("/api/invite/:token", handle_cors_preflight)
         .options_async("/api/invite/:token/accept", handle_cors_preflight)
@@ -545,6 +548,20 @@ async fn main(req: Request, env: Env, worker_ctx: Context) -> Result<Response> {
         .delete_async(
             "/api/orgs/:id/logo",
             crate::api::orgs::handle_delete_org_logo,
+        )
+        // Domain verification routes
+        .post_async("/api/orgs/:id/domains", crate::api::orgs::handle_add_domain)
+        .get_async(
+            "/api/orgs/:id/domains",
+            crate::api::orgs::handle_list_domains,
+        )
+        .post_async(
+            "/api/orgs/:id/verify-domain",
+            crate::api::orgs::handle_verify_domain,
+        )
+        .delete_async(
+            "/api/orgs/:id/domains/:domain",
+            crate::api::orgs::handle_delete_domain,
         )
         // Invite routes (GET is public, POST requires auth)
         .get_async(

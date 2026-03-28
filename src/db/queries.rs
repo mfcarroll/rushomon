@@ -2419,7 +2419,7 @@ pub async fn get_user_orgs(db: &D1Database, user_id: &str) -> Result<Vec<OrgWith
 }
 
 /// Get the membership record for a specific user in a specific org.
-/// Falls back to users.org_id ownership check and auto-inserts the row to self-heal.
+/// Fall back self-healing removed to fix privilege escalation bug. Migration is by covered by 0011_org_members.sql.
 pub async fn get_org_member(
     db: &D1Database,
     org_id: &str,
@@ -2430,48 +2430,10 @@ pub async fn get_org_member(
          FROM org_members
          WHERE org_id = ?1 AND user_id = ?2",
     );
-    let existing = stmt
-        .bind(&[org_id.into(), user_id.into()])?
+
+    stmt.bind(&[org_id.into(), user_id.into()])?
         .first::<OrgMember>(None)
-        .await?;
-
-    if existing.is_some() {
-        return Ok(existing);
-    }
-
-    // Not in org_members — check if org_id matches users.org_id (pre-migration user)
-    let user_row = db
-        .prepare("SELECT org_id, created_at FROM users WHERE id = ?1")
-        .bind(&[user_id.into()])?
-        .first::<serde_json::Value>(None)
-        .await?;
-
-    let Some(user_row) = user_row else {
-        return Ok(None);
-    };
-
-    if user_row["org_id"].as_str() != Some(org_id) {
-        return Ok(None);
-    }
-
-    let joined_at = user_row["created_at"].as_f64().unwrap_or(0.0) as i64;
-
-    // Auto-heal: insert the missing membership row
-    db.prepare(
-        "INSERT INTO org_members (org_id, user_id, role, joined_at)
-         VALUES (?1, ?2, 'owner', ?3)
-         ON CONFLICT(org_id, user_id) DO NOTHING",
-    )
-    .bind(&[org_id.into(), user_id.into(), (joined_at as f64).into()])?
-    .run()
-    .await?;
-
-    Ok(Some(OrgMember {
-        org_id: org_id.to_string(),
-        user_id: user_id.to_string(),
-        role: "owner".to_string(),
-        joined_at,
-    }))
+        .await
 }
 
 /// Get all members of an org with user details
@@ -2799,6 +2761,26 @@ pub async fn pending_invite_exists(db: &D1Database, org_id: &str, email: &str) -
         .first::<serde_json::Value>(None)
         .await?
         .is_some())
+}
+
+/// Look up pending invitations by email
+pub async fn get_pending_invitations_by_email(
+    db: &D1Database,
+    email: &str,
+) -> Result<Vec<OrgInvitation>> {
+    let now = now_timestamp();
+    let stmt = db.prepare(
+        "SELECT id, org_id, invited_by, email, role, created_at, expires_at, accepted_at
+         FROM org_invitations
+         WHERE email = ?1 AND accepted_at IS NULL AND expires_at > ?2
+         ORDER BY created_at ASC",
+    );
+
+    let results = stmt
+        .bind(&[email.into(), (now as f64).into()])?
+        .all()
+        .await?;
+    results.results::<OrgInvitation>()
 }
 
 /// Get user by email (used during invite acceptance to find the accepting user)
@@ -3740,5 +3722,109 @@ pub async fn update_api_key_last_used(
 ) -> worker::Result<()> {
     let stmt = db.prepare("UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2");
     stmt.bind(&[timestamp.into(), key_id.into()])?.run().await?;
+    Ok(())
+}
+
+use crate::models::org_domain::OrgDomain;
+
+// ─── Domain Verification Queries (For JIT Provisioning) ──────────────────────
+
+/// Get an org domain record by domain (prioritize verified records if multiple exist)
+pub async fn get_org_domain_record(db: &D1Database, domain: &str) -> Result<Option<OrgDomain>> {
+    let stmt = db.prepare(
+        "SELECT id, org_id, domain, verification_method, verification_token, is_verified, created_at, verified_at
+         FROM org_domains WHERE domain = ?1 ORDER BY is_verified DESC LIMIT 1"
+    );
+    stmt.bind(&[domain.into()])?.first::<OrgDomain>(None).await
+}
+
+/// Find an organization by a verified domain
+pub async fn get_org_by_verified_domain(
+    db: &D1Database,
+    domain: &str,
+) -> Result<Option<crate::models::Organization>> {
+    let stmt = db.prepare(
+        "SELECT o.* FROM organizations o
+         JOIN org_domains od ON o.id = od.org_id
+         WHERE od.domain = ?1 AND od.is_verified = 1",
+    );
+
+    stmt.bind(&[domain.into()])?
+        .first::<crate::models::Organization>(None)
+        .await
+}
+
+/// Mark a domain as verified
+pub async fn mark_domain_verified(db: &D1Database, domain: &str) -> Result<()> {
+    let now = crate::utils::now_timestamp();
+    let stmt =
+        db.prepare("UPDATE org_domains SET is_verified = 1, verified_at = ?1 WHERE domain = ?2");
+    stmt.bind(&[(now as f64).into(), domain.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Add a new domain challenge to an organization
+pub async fn add_org_domain_challenge(
+    db: &D1Database,
+    org_id: &str,
+    domain: &str,
+    token: &str,
+) -> Result<OrgDomain> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = crate::utils::now_timestamp();
+
+    // Convert to lowercase to ensure consistency
+    let normalized_domain = domain.to_lowercase();
+
+    // Clean up any existing unverified challenges for this domain to prevent squatting
+    let cleanup_stmt = db.prepare("DELETE FROM org_domains WHERE domain = ?1 AND is_verified = 0");
+    cleanup_stmt
+        .bind(&[normalized_domain.clone().into()])?
+        .run()
+        .await?;
+
+    let stmt = db.prepare(
+        "INSERT INTO org_domains (id, org_id, domain, verification_method, verification_token, is_verified, created_at)
+         VALUES (?1, ?2, ?3, 'dns', ?4, 0, ?5)"
+    );
+
+    stmt.bind(&[
+        id.clone().into(),
+        org_id.into(),
+        normalized_domain.clone().into(),
+        token.into(),
+        (now as f64).into(),
+    ])?
+    .run()
+    .await?;
+
+    Ok(OrgDomain {
+        id,
+        org_id: org_id.to_string(),
+        domain: normalized_domain,
+        verification_method: "dns".to_string(),
+        verification_token: Some(token.to_string()),
+        is_verified: false,
+        created_at: now,
+        verified_at: None,
+    })
+}
+
+/// List all domains for an organization
+pub async fn list_org_domains(db: &D1Database, org_id: &str) -> Result<Vec<OrgDomain>> {
+    let stmt = db.prepare(
+        "SELECT id, org_id, domain, verification_method, verification_token, is_verified, created_at, verified_at
+         FROM org_domains WHERE org_id = ?1 ORDER BY created_at DESC"
+    );
+    let results = stmt.bind(&[org_id.into()])?.all().await?;
+    results.results::<OrgDomain>()
+}
+
+/// Delete a domain from an organization
+pub async fn delete_org_domain(db: &D1Database, org_id: &str, domain: &str) -> Result<()> {
+    let stmt = db.prepare("DELETE FROM org_domains WHERE org_id = ?1 AND domain = ?2");
+    stmt.bind(&[org_id.into(), domain.into()])?.run().await?;
     Ok(())
 }

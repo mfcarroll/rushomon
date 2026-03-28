@@ -1,6 +1,6 @@
 use crate::auth::providers::{NormalizedUser, OAuthProviderConfig};
 use crate::db::queries;
-use crate::models::{Organization, User, user::CreateUserData};
+use crate::models::{OrgInvitation, Organization, User, user::CreateUserData};
 use serde::{Deserialize, Serialize};
 use worker::{D1Database, Env, Error, Request, Response, Result, console_log, kv::KvStore};
 
@@ -286,6 +286,19 @@ async fn create_or_get_user(
     db: &D1Database,
     normalized_user: NormalizedUser,
 ) -> Result<(User, Organization)> {
+    // Determine the JIT domain context first (apply to lowercase!)
+    let email_domain = normalized_user
+        .email
+        .split('@')
+        .nth(1)
+        .unwrap_or("")
+        .to_lowercase();
+    let jit_org = queries::get_org_by_verified_domain(db, &email_domain).await?;
+
+    // Check for pending invite to evaluate during JIT provisioning
+    let pending_invites: Vec<OrgInvitation> =
+        queries::get_pending_invitations_by_email(db, &normalized_user.email).await?;
+
     // Step 1: look up by (provider, provider_id)
     let stmt = db.prepare(
         "SELECT id, email, name, avatar_url, oauth_provider, oauth_id, org_id, role, created_at
@@ -311,6 +324,24 @@ async fn create_or_get_user(
         };
 
         let updated_user = queries::create_or_update_user(db, create_data, &user.org_id).await?;
+
+        if let Some(org) = jit_org {
+            if queries::get_org_member(db, &org.id, &updated_user.id)
+                .await?
+                .is_none()
+            {
+                queries::add_org_member(db, &org.id, &updated_user.id, "member").await?;
+            }
+
+            // Mark pending invite as accepted if it matches org
+            for invite in &pending_invites {
+                if invite.org_id == org.id {
+                    let _ = queries::accept_invitation(db, &invite.id).await;
+                }
+            }
+
+            return Ok((updated_user, org));
+        }
 
         let org = queries::get_org_by_id(db, &user.org_id)
             .await?
@@ -362,6 +393,24 @@ async fn create_or_get_user(
 
         let updated_user = queries::create_or_update_user(db, create_data, &user.org_id).await?;
 
+        if let Some(org) = jit_org {
+            if queries::get_org_member(db, &org.id, &updated_user.id)
+                .await?
+                .is_none()
+            {
+                queries::add_org_member(db, &org.id, &updated_user.id, "member").await?;
+            }
+
+            // Mark pending invite as accepted if it matches org
+            for invite in &pending_invites {
+                if invite.org_id == org.id {
+                    let _ = queries::accept_invitation(db, &invite.id).await;
+                }
+            }
+
+            return Ok((updated_user, org));
+        }
+
         let org = queries::get_org_by_id(db, &user.org_id)
             .await?
             .ok_or_else(|| Error::RustError("Organization not found".to_string()))?;
@@ -369,13 +418,37 @@ async fn create_or_get_user(
         return Ok((updated_user, org));
     }
 
-    // Step 3: new user — check if signups are enabled (first user is always allowed)
+    // Step 3: Check for Just-In-Time Domain Provisioning (New User)
+    if let Some(org) = jit_org {
+        let create_data = CreateUserData {
+            email: normalized_user.email.clone(),
+            name: normalized_user.name.clone(),
+            avatar_url: normalized_user.avatar_url.clone(),
+            oauth_provider: normalized_user.provider.clone(),
+            oauth_id: normalized_user.provider_id.clone(),
+        };
+
+        let user = queries::create_or_update_user(db, create_data, &org.id).await?;
+        queries::add_org_member(db, &org.id, &user.id, "member").await?;
+
+        // Mark pending invite as accepted if it matches org
+        for invite in &pending_invites {
+            if invite.org_id == org.id {
+                let _ = queries::accept_invitation(db, &invite.id).await;
+            }
+        }
+
+        return Ok((user, org));
+    }
+
+    // Step 4: new user — check if signups are enabled
     let user_count = queries::get_user_count(db).await?;
     if user_count > 0 {
         let signups_enabled = queries::get_setting(db, "signups_enabled")
             .await?
             .unwrap_or_else(|| "true".to_string());
-        if signups_enabled != "true" {
+
+        if signups_enabled != "true" && pending_invites.is_empty() {
             return Err(Error::RustError("SIGNUPS_DISABLED".to_string()));
         }
     }

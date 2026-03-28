@@ -755,7 +755,7 @@ pub async fn handle_resend_invitation(req: Request, ctx: RouteContext<()>) -> Re
 
 // ─── GET /api/invite/:token (public) ────────────────────────────────────────
 /// Validate an invite token and return org/inviter info (no auth required)
-pub async fn handle_get_invite_info(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+pub async fn handle_get_invite_info(req: Request, ctx: RouteContext<()>) -> Result<Response> {
     let token = ctx
         .param("token")
         .ok_or_else(|| Error::RustError("Missing token".to_string()))?
@@ -772,15 +772,30 @@ pub async fn handle_get_invite_info(_req: Request, ctx: RouteContext<()>) -> Res
         }
     };
 
+    // 1. Check if the user is already a member (e.g. verified domain user that was manually invited)
+    let mut is_member = false;
+    if let Ok(user_ctx) = auth::authenticate_request(&req, &ctx).await
+        && db::get_org_member(&db, &invitation.org_id, &user_ctx.user_id)
+            .await?
+            .is_some()
+    {
+        is_member = true;
+    }
+
     let now = crate::utils::now_timestamp();
 
-    if invitation.accepted_at.is_some() {
-        return Response::from_json(
-            &serde_json::json!({ "valid": false, "reason": "already_accepted" }),
-        );
-    }
-    if invitation.expires_at < now {
-        return Response::from_json(&serde_json::json!({ "valid": false, "reason": "expired" }));
+    // 2. Reject accepted/expired invitations if the user ISN'T already a member
+    if !is_member {
+        if invitation.accepted_at.is_some() {
+            return Response::from_json(
+                &serde_json::json!({ "valid": false, "reason": "already_accepted" }),
+            );
+        }
+        if invitation.expires_at < now {
+            return Response::from_json(
+                &serde_json::json!({ "valid": false, "reason": "expired" }),
+            );
+        }
     }
 
     let org = db::get_org_by_id(&db, &invitation.org_id)
@@ -798,6 +813,7 @@ pub async fn handle_get_invite_info(_req: Request, ctx: RouteContext<()>) -> Res
         "invited_by": inviter_name,
         "email": invitation.email,
         "expires_at": invitation.expires_at,
+        "is_member": is_member,
     }))
 }
 
@@ -839,12 +855,68 @@ pub async fn handle_accept_invite(req: Request, ctx: RouteContext<()>) -> Result
         return Response::error("This invitation was sent to a different email address", 403);
     }
 
-    // Check not already a member
-    if db::get_org_member(&db, &invitation.org_id, &user_ctx.user_id)
-        .await?
-        .is_some()
+    // Check if already a member (e.g., via JIT provisioning)
+    // If so, gracefully accept the invite (updating role if needed) instead of throwing an error.
+    if let Some(existing_member) =
+        db::get_org_member(&db, &invitation.org_id, &user_ctx.user_id).await?
     {
-        return Response::error("You are already a member of this organization", 409);
+        // If the invitation offers a different role, update it now
+        if existing_member.role != invitation.role {
+            db::update_user_role(&db, &user_ctx.user_id, &invitation.role).await?;
+        }
+
+        // Mark the invitation as accepted so it's no longer pending
+        db::accept_invitation(&db, &token).await?;
+
+        // Return the success response (re-issuing token for the org context)
+        let _org = db::get_org_by_id(&db, &invitation.org_id)
+            .await?
+            .ok_or_else(|| Error::RustError("Organization not found".to_string()))?;
+
+        let tier = get_org_tier(&db, &_org).await;
+
+        let jwt_secret = ctx.env.secret("JWT_SECRET")?.to_string();
+        let new_access_token = auth::session::create_access_token(
+            &user_ctx.user_id,
+            &invitation.org_id,
+            &user_ctx.session_id,
+            &invitation.role, // Use the (potentially newly upgraded) role
+            &jwt_secret,
+        )?;
+
+        // Update the session in KV
+        let kv = ctx.kv("URL_MAPPINGS")?;
+        auth::session::store_session(
+            &kv,
+            &user_ctx.session_id,
+            &user_ctx.user_id,
+            &invitation.org_id,
+        )
+        .await?;
+
+        let domain = ctx
+            .env
+            .var("DOMAIN")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "localhost:8787".to_string());
+        let scheme = if domain.starts_with("localhost") {
+            "http"
+        } else {
+            "https"
+        };
+        let access_cookie =
+            auth::session::create_access_cookie_with_scheme(&new_access_token, scheme);
+
+        let mut response = Response::from_json(&serde_json::json!({
+            "org": {
+                "id": _org.id,
+                "name": _org.name,
+                "tier": tier.as_str(),
+                "role": invitation.role,
+            },
+        }))?;
+        response.headers_mut().set("Set-Cookie", &access_cookie)?;
+        return Ok(response);
     }
 
     // Add user to org and mark invitation accepted
@@ -1043,6 +1115,170 @@ pub async fn handle_get_org_logo(_req: Request, ctx: RouteContext<()>) -> Result
         }
         None => Response::error("Logo not found", 404),
     }
+}
+
+// ─── POST /api/orgs/:id/domains ─────────────────────────────────────────────
+/// Add a new domain to the organization to be verified
+pub async fn handle_add_domain(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let user_ctx = match auth::authenticate_request(&req, &ctx).await {
+        Ok(ctx) => ctx,
+        Err(e) => return Ok(e.into_response()),
+    };
+
+    let org_id = ctx
+        .param("id")
+        .ok_or_else(|| Error::RustError("Missing org id".to_string()))?
+        .to_string();
+    let db = ctx.env.get_binding::<D1Database>("rushomon")?;
+
+    // Admin/Owner check
+    let member = db::get_org_member(&db, &org_id, &user_ctx.user_id).await?;
+    match &member {
+        Some(m) if m.role == "owner" || m.role == "admin" => {}
+        Some(_) => return Response::error("Only org owners and admins can add domains", 403),
+        None => return Response::error("Organization not found", 404),
+    }
+
+    let body: serde_json::Value = req
+        .json()
+        .await
+        .map_err(|_| Error::RustError("Invalid JSON".into()))?;
+    let domain = match body["domain"].as_str() {
+        Some(d) if !d.trim().is_empty() => d.trim().to_lowercase(),
+        _ => return Response::error("Domain is required", 400),
+    };
+
+    // Make sure domain isn't already claimed
+    if let Ok(Some(record)) = crate::db::queries::get_org_domain_record(&db, &domain).await
+        && record.is_verified
+    {
+        return Response::error("Domain is already verified by an organization", 409);
+    }
+
+    // Generate a secure random verification token
+    let token = uuid::Uuid::new_v4().to_string().replace("-", "");
+
+    let org_domain =
+        crate::db::queries::add_org_domain_challenge(&db, &org_id, &domain, &token).await?;
+
+    let verification_record = format!("rushomon-verification={}", token);
+
+    Response::from_json(&serde_json::json!({
+        "domain": org_domain,
+        "token": token,
+        "verification_record": verification_record,
+        "instructions": format!("Add a TXT record to {} with the value: {}", domain, verification_record)
+    }))
+}
+
+// ─── GET /api/orgs/:id/domains ──────────────────────────────────────────────
+/// List all domains associated with the org
+pub async fn handle_list_domains(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let user_ctx = match auth::authenticate_request(&req, &ctx).await {
+        Ok(ctx) => ctx,
+        Err(e) => return Ok(e.into_response()),
+    };
+
+    let org_id = ctx
+        .param("id")
+        .ok_or_else(|| Error::RustError("Missing org id".to_string()))?
+        .to_string();
+    let db = ctx.env.get_binding::<D1Database>("rushomon")?;
+
+    let member = db::get_org_member(&db, &org_id, &user_ctx.user_id).await?;
+    if member.is_none() {
+        return Response::error("Organization not found", 404);
+    }
+
+    let domains = crate::db::queries::list_org_domains(&db, &org_id).await?;
+    Response::from_json(&serde_json::json!({ "domains": domains }))
+}
+
+// ─── POST /api/orgs/:id/verify-domain ───────────────────────────────────────
+/// Verify DNS ownership of an organization domain (owner/admin only)
+pub async fn handle_verify_domain(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let user_ctx = match auth::authenticate_request(&req, &ctx).await {
+        Ok(ctx) => ctx,
+        Err(e) => return Ok(e.into_response()),
+    };
+
+    let org_id = ctx
+        .param("id")
+        .ok_or_else(|| Error::RustError("Missing org id".to_string()))?
+        .to_string();
+
+    let db = ctx.env.get_binding::<D1Database>("rushomon")?;
+
+    let member = db::get_org_member(&db, &org_id, &user_ctx.user_id).await?;
+    match &member {
+        Some(m) if m.role == "owner" || m.role == "admin" => {}
+        Some(_) => return Response::error("Only org owners and admins can verify domains", 403),
+        None => return Response::error("Organization not found", 404),
+    }
+
+    let body: serde_json::Value = req
+        .json()
+        .await
+        .map_err(|_| Error::RustError("Invalid JSON body".to_string()))?;
+
+    let domain = match body["domain"].as_str() {
+        Some(d) if !d.trim().is_empty() => d.trim().to_lowercase(),
+        _ => return Response::error("Domain is required", 400),
+    };
+
+    let domain_record = crate::db::queries::get_org_domain_record(&db, &domain).await?;
+
+    if let Some(record) = domain_record {
+        if record.org_id != org_id {
+            return Response::error("Domain does not belong to this organization", 403);
+        }
+
+        if let Some(token) = record.verification_token {
+            if crate::utils::dns::verify_dns_txt(&domain, &token).await? {
+                crate::db::queries::mark_domain_verified(&db, &domain).await?;
+                return Response::ok("Domain verified successfully");
+            }
+        } else {
+            return Response::error("No verification token found for this domain", 400);
+        }
+    }
+
+    Response::error(
+        format!(
+            "DNS record for {domain} not found or incorrect. Please check your DNS settings and try again in a few minutes."
+        ),
+        400,
+    )
+}
+
+// ─── DELETE /api/orgs/:id/domains/:domain ───────────────────────────────────
+/// Remove a domain from the organization
+pub async fn handle_delete_domain(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let user_ctx = match auth::authenticate_request(&req, &ctx).await {
+        Ok(ctx) => ctx,
+        Err(e) => return Ok(e.into_response()),
+    };
+
+    let org_id = ctx
+        .param("id")
+        .ok_or_else(|| Error::RustError("Missing org id".to_string()))?
+        .to_string();
+    let domain = ctx
+        .param("domain")
+        .ok_or_else(|| Error::RustError("Missing domain".to_string()))?
+        .to_string();
+    let db = ctx.env.get_binding::<D1Database>("rushomon")?;
+
+    // Admin/Owner check
+    let member = db::get_org_member(&db, &org_id, &user_ctx.user_id).await?;
+    match &member {
+        Some(m) if m.role == "owner" || m.role == "admin" => {}
+        Some(_) => return Response::error("Only org owners and admins can remove domains", 403),
+        None => return Response::error("Organization not found", 404),
+    }
+
+    crate::db::queries::delete_org_domain(&db, &org_id, &domain).await?;
+    Response::ok("Domain removed")
 }
 
 // ─── DELETE /api/orgs/:id/logo ────────────────────────────────────────────────

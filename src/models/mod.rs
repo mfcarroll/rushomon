@@ -1,6 +1,7 @@
 pub mod analytics;
 pub mod billing_account;
 pub mod link;
+pub mod org_domain;
 pub mod org_member;
 pub mod organization;
 pub mod pagination;
