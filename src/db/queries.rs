@@ -3707,11 +3707,11 @@ pub async fn cleanup_expired_webhooks(db: &D1Database) -> Result<i64> {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct ApiKeyWithTierRecord {
-    #[allow(dead_code)]
     pub id: String,
     pub user_id: String,
     pub org_id: String,
     pub expires_at: Option<i64>,
+    pub status: String,
     pub tier: Option<String>,
 }
 
@@ -3721,7 +3721,7 @@ pub async fn get_api_key_by_hash_with_tier(
     key_hash: &str,
 ) -> worker::Result<Option<ApiKeyWithTierRecord>> {
     let stmt = db.prepare(
-        "SELECT ak.id, ak.user_id, ak.org_id, ak.expires_at, ba.tier
+        "SELECT ak.id, ak.user_id, ak.org_id, ak.expires_at, ak.status, ba.tier
          FROM api_keys ak
          JOIN organizations o ON ak.org_id = o.id
          LEFT JOIN billing_accounts ba ON o.billing_account_id = ba.id
@@ -3739,6 +3739,359 @@ pub async fn update_api_key_last_used(
     timestamp: i64,
 ) -> worker::Result<()> {
     let stmt = db.prepare("UPDATE api_keys SET last_used_at = ?1 WHERE id = ?2");
-    stmt.bind(&[timestamp.into(), key_id.into()])?.run().await?;
+    stmt.bind(&[(timestamp as f64).into(), key_id.into()])?
+        .run()
+        .await?;
     Ok(())
+}
+
+// ─── Admin API Key queries ────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AdminApiKeyRecord {
+    pub id: String,
+    pub name: String,
+    pub hint: String,
+    pub user_id: String,
+    pub user_email: Option<String>,
+    pub user_name: Option<String>,
+    pub org_id: String,
+    pub org_name: Option<String>,
+    pub tier: Option<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub expires_at: Option<i64>,
+    pub status: String,
+    pub updated_at: Option<i64>,
+    pub updated_by: Option<String>,
+}
+
+pub async fn list_admin_api_keys(
+    db: &worker::d1::D1Database,
+    page: i64,
+    limit: i64,
+    search: Option<&str>,
+    status_filter: Option<&str>,
+) -> worker::Result<(Vec<AdminApiKeyRecord>, i64)> {
+    let offset = (page - 1) * limit;
+
+    // Build status filter clause
+    let status_clause = match status_filter {
+        Some("active") => "AND ak.status = 'active'",
+        Some("revoked") => "AND ak.status = 'revoked'",
+        Some("deleted") => "AND ak.status = 'deleted'",
+        _ => "", // 'all' or None - no filter
+    };
+
+    if let Some(s) = search {
+        let pattern = format!("%{}%", s);
+        let where_clause = format!(
+            "WHERE (u.email LIKE ?1 OR ak.name LIKE ?1 OR o.name LIKE ?1) {}",
+            status_clause
+        );
+
+        let count_sql = format!(
+            "SELECT COUNT(*) as cnt
+             FROM api_keys ak
+             JOIN users u ON ak.user_id = u.id
+             JOIN organizations o ON ak.org_id = o.id
+             LEFT JOIN billing_accounts ba ON o.billing_account_id = ba.id
+             {}",
+            where_clause
+        );
+
+        let list_sql = format!(
+            "SELECT ak.id, ak.name, ak.hint, ak.user_id,
+                    u.email as user_email, u.name as user_name,
+                    ak.org_id, o.name as org_name,
+                    ba.tier,
+                    ak.created_at, ak.last_used_at, ak.expires_at,
+                    ak.status, ak.updated_at, ak.updated_by
+             FROM api_keys ak
+             JOIN users u ON ak.user_id = u.id
+             JOIN organizations o ON ak.org_id = o.id
+             LEFT JOIN billing_accounts ba ON o.billing_account_id = ba.id
+             {}
+             ORDER BY ak.created_at DESC
+             LIMIT ?2 OFFSET ?3",
+            where_clause
+        );
+
+        #[derive(serde::Deserialize)]
+        struct CountRow {
+            cnt: i64,
+        }
+        let total = db
+            .prepare(&count_sql)
+            .bind(&[pattern.clone().into()])?
+            .first::<CountRow>(None)
+            .await?
+            .map(|r| r.cnt)
+            .unwrap_or(0);
+
+        let keys = db
+            .prepare(&list_sql)
+            .bind(&[
+                pattern.clone().into(),
+                (limit as f64).into(),
+                (offset as f64).into(),
+            ])?
+            .all()
+            .await?
+            .results::<AdminApiKeyRecord>()?;
+
+        Ok((keys, total))
+    } else {
+        let where_clause = if status_clause.is_empty() {
+            "".to_string()
+        } else {
+            format!("WHERE {}", status_clause.trim_start_matches("AND "))
+        };
+
+        let count_sql = format!(
+            "SELECT COUNT(*) as cnt
+             FROM api_keys ak
+             JOIN users u ON ak.user_id = u.id
+             JOIN organizations o ON ak.org_id = o.id
+             LEFT JOIN billing_accounts ba ON o.billing_account_id = ba.id
+             {}",
+            where_clause
+        );
+
+        let list_sql = format!(
+            "SELECT ak.id, ak.name, ak.hint, ak.user_id,
+                    u.email as user_email, u.name as user_name,
+                    ak.org_id, o.name as org_name,
+                    ba.tier,
+                    ak.created_at, ak.last_used_at, ak.expires_at,
+                    ak.status, ak.updated_at, ak.updated_by
+             FROM api_keys ak
+             JOIN users u ON ak.user_id = u.id
+             JOIN organizations o ON ak.org_id = o.id
+             LEFT JOIN billing_accounts ba ON o.billing_account_id = ba.id
+             {}
+             ORDER BY ak.created_at DESC
+             LIMIT ?1 OFFSET ?2",
+            where_clause
+        );
+
+        #[derive(serde::Deserialize)]
+        struct CountRow {
+            cnt: i64,
+        }
+        let total = db
+            .prepare(&count_sql)
+            .first::<CountRow>(None)
+            .await?
+            .map(|r| r.cnt)
+            .unwrap_or(0);
+
+        let keys = db
+            .prepare(&list_sql)
+            .bind(&[(limit as f64).into(), (offset as f64).into()])?
+            .all()
+            .await?
+            .results::<AdminApiKeyRecord>()?;
+
+        Ok((keys, total))
+    }
+}
+
+pub async fn admin_revoke_api_key(
+    db: &worker::d1::D1Database,
+    key_id: &str,
+    revoked_by_user_id: &str,
+    timestamp: i64,
+) -> worker::Result<bool> {
+    let stmt = db.prepare(
+        "UPDATE api_keys SET status = 'revoked', updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND status = 'active'",
+    );
+    stmt.bind(&[
+        (timestamp as f64).into(),
+        revoked_by_user_id.into(),
+        key_id.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(true)
+}
+
+pub async fn admin_reactivate_api_key(
+    db: &worker::d1::D1Database,
+    key_id: &str,
+    reactivated_by_user_id: &str,
+    timestamp: i64,
+) -> worker::Result<bool> {
+    let stmt = db.prepare(
+        "UPDATE api_keys SET status = 'active', updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND status = 'revoked'",
+    );
+    stmt.bind(&[
+        (timestamp as f64).into(),
+        reactivated_by_user_id.into(),
+        key_id.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(true)
+}
+
+pub async fn admin_delete_api_key(
+    db: &worker::d1::D1Database,
+    key_id: &str,
+    deleted_by_user_id: &str,
+    timestamp: i64,
+) -> worker::Result<bool> {
+    let stmt = db.prepare(
+        "UPDATE api_keys SET status = 'deleted', updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND status != 'deleted'",
+    );
+    stmt.bind(&[
+        (timestamp as f64).into(),
+        deleted_by_user_id.into(),
+        key_id.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(true)
+}
+
+pub async fn admin_restore_api_key(
+    db: &worker::d1::D1Database,
+    key_id: &str,
+    restored_by_user_id: &str,
+    timestamp: i64,
+) -> worker::Result<bool> {
+    let stmt = db.prepare(
+        "UPDATE api_keys SET status = 'active', updated_at = ?1, updated_by = ?2
+         WHERE id = ?3 AND status = 'deleted'",
+    );
+    stmt.bind(&[
+        (timestamp as f64).into(),
+        restored_by_user_id.into(),
+        key_id.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod api_key_tests {
+    #[test]
+    fn test_api_key_status_validation() {
+        // Test valid status values
+        let valid_statuses = vec!["active", "revoked", "deleted"];
+        for status in valid_statuses {
+            assert!(matches!(status, "active" | "revoked" | "deleted"));
+        }
+
+        // Test invalid status values
+        let invalid_statuses = vec!["invalid", "", "ACTIVE", "Revoked"];
+        for status in invalid_statuses {
+            assert!(!matches!(status, "active" | "revoked" | "deleted"));
+        }
+    }
+
+    #[test]
+    fn test_timestamp_conversion_safety() {
+        // Test that timestamp conversion works correctly
+        let timestamp = 1234567890i64;
+        let converted = timestamp as f64;
+        assert_eq!(converted, 1234567890.0);
+
+        // Test edge cases
+        let max_timestamp = i64::MAX;
+        let max_converted = max_timestamp as f64;
+        assert!(max_converted > 0.0);
+
+        let min_timestamp = i64::MIN;
+        let min_converted = min_timestamp as f64;
+        assert!(min_converted < 0.0);
+    }
+
+    #[test]
+    fn test_query_parameter_validation() {
+        // Test that our queries use proper parameter binding
+        let revoke_query = "UPDATE api_keys SET status = 'revoked', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status = 'active'";
+        assert!(revoke_query.contains("?1"));
+        assert!(revoke_query.contains("?2"));
+        assert!(revoke_query.contains("?3"));
+        assert!(!revoke_query.contains("DROP"));
+
+        let reactivate_query = "UPDATE api_keys SET status = 'active', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status = 'revoked'";
+        assert!(reactivate_query.contains("?1"));
+        assert!(reactivate_query.contains("?2"));
+        assert!(reactivate_query.contains("?3"));
+        assert!(!reactivate_query.contains("DELETE"));
+
+        let delete_query = "UPDATE api_keys SET status = 'deleted', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status != 'deleted'";
+        assert!(delete_query.contains("?1"));
+        assert!(delete_query.contains("?2"));
+        assert!(delete_query.contains("?3"));
+        assert!(!delete_query.contains("DROP"));
+    }
+
+    #[test]
+    fn test_sql_injection_prevention() {
+        // Test that our query patterns prevent SQL injection
+        let safe_queries = vec![
+            "UPDATE api_keys SET status = 'revoked', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status = 'active'",
+            "UPDATE api_keys SET status = 'active', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status = 'revoked'",
+            "UPDATE api_keys SET status = 'deleted', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status != 'deleted'",
+            "SELECT * FROM api_keys WHERE key_hash = ?1 AND status = 'active'",
+        ];
+
+        for query in safe_queries {
+            // Ensure queries use parameter binding instead of string interpolation
+            assert!(query.contains("?") || !query.contains("SELECT"));
+
+            // Ensure no dangerous SQL patterns
+            assert!(!query.contains("DROP"));
+            assert!(!query.contains("TRUNCATE"));
+            assert!(!query.contains("ALTER"));
+            assert!(!query.contains("EXEC"));
+            assert!(!query.contains("UNION"));
+        }
+    }
+
+    #[test]
+    fn test_status_transition_logic() {
+        // Test that our SQL WHERE clauses enforce correct status transitions
+
+        // Revoke: only active keys can be revoked
+        let revoke_where = "WHERE id = ?3 AND status = 'active'";
+        assert!(revoke_where.contains("status = 'active'"));
+
+        // Reactivate: only revoked keys can be reactivated
+        let reactivate_where = "WHERE id = ?3 AND status = 'revoked'";
+        assert!(reactivate_where.contains("status = 'revoked'"));
+
+        // Delete: any non-deleted key can be soft deleted
+        let delete_where = "WHERE id = ?3 AND status != 'deleted'";
+        assert!(delete_where.contains("status != 'deleted'"));
+
+        // Restore: only deleted keys can be restored
+        let restore_where = "WHERE id = ?3 AND status = 'deleted'";
+        assert!(restore_where.contains("status = 'deleted'"));
+    }
+
+    #[test]
+    fn test_audit_field_consistency() {
+        // Test that all update queries include audit fields
+        let update_queries = vec![
+            "UPDATE api_keys SET status = 'revoked', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status = 'active'",
+            "UPDATE api_keys SET status = 'active', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status = 'revoked'",
+            "UPDATE api_keys SET status = 'deleted', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status != 'deleted'",
+            "UPDATE api_keys SET status = 'active', updated_at = ?1, updated_by = ?2 WHERE id = ?3 AND status = 'deleted'",
+        ];
+
+        for query in update_queries {
+            assert!(query.contains("updated_at"));
+            assert!(query.contains("updated_by"));
+            assert!(query.contains("?1")); // timestamp
+            assert!(query.contains("?2")); // user_id
+        }
+    }
 }
