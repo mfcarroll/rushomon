@@ -352,8 +352,8 @@ jobs:
           fi
 
           # Check OpenAPI spec exists
-          if [ ! -f "docs/openapi/${VERSION}.json" ]; then
-            echo "❌ Missing OpenAPI spec: docs/openapi/${VERSION}.json"
+          if [ ! -f "docs/openapi/${TAG}.json" ]; then
+            echo "❌ Missing OpenAPI spec: docs/openapi/${TAG}.json"
             echo "💡 Run 'make version-tag' to create versioned docs before tagging"
             exit 1
           fi
@@ -373,13 +373,6 @@ jobs:
           fi
 
           echo "✅ All versioned docs found for $TAG"
-
-      - name: Copy versioned spec to main.json
-        run: |
-          TAG="${{ steps.version.outputs.tag }}"
-          VERSION="${TAG#v}"
-          cp "docs/openapi/${VERSION}.json" docs/openapi/main.json
-          echo "✅ Copied ${VERSION}.json to main.json"
 
       - name: Install docs-site dependencies
         working-directory: docs-site
