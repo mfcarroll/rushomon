@@ -7,6 +7,7 @@ use crate::models::{
     link::{CreateLinkRequest, Link, LinkStatus, UpdateLinkRequest},
     user::User,
 };
+use crate::repositories::tag_repository::{TagRepository, validate_and_normalize_tags};
 use crate::utils::{generate_short_code, now_timestamp, validate_short_code, validate_url};
 use chrono::{Datelike, TimeZone};
 use std::future::Future;
@@ -549,7 +550,7 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
 
     // Validate and normalize tags if provided
     let normalized_tags = if let Some(tags) = body.tags {
-        match db::validate_and_normalize_tags(&tags) {
+        match validate_and_normalize_tags(&tags) {
             Ok(t) => t,
             Err(e) => return Response::error(e.to_string(), 400),
         }
@@ -562,8 +563,9 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
         && let Some(max_tags) = tier_limits.max_tags
     {
         // Get current count of distinct tags in the billing account
-        let current_tag_count =
-            db::count_distinct_tags_for_billing_account(&db, &billing_account.id).await?;
+        let current_tag_count = TagRepository::new()
+            .count_distinct_tags_for_billing_account(&db, &billing_account.id)
+            .await?;
 
         // Find which tags are new to the BA (not already in use)
         let mut new_tag_count = 0;
@@ -1234,7 +1236,7 @@ pub async fn handle_update_link(mut req: Request, ctx: RouteContext<()>) -> Resu
 
     // Update tags if provided
     if let Some(tags) = update_req.tags {
-        let normalized_tags = match db::validate_and_normalize_tags(&tags) {
+        let normalized_tags = match validate_and_normalize_tags(&tags) {
             Ok(t) => t,
             Err(e) => return Response::error(e.to_string(), 400),
         };
@@ -1245,9 +1247,9 @@ pub async fn handle_update_link(mut req: Request, ctx: RouteContext<()>) -> Resu
             && let Some(max_tags) = limits.max_tags
         {
             // Get current count of distinct tags in the billing account
-            let current_tag_count =
-                db::count_distinct_tags_for_billing_account(&db, &billing_account_update.id)
-                    .await?;
+            let current_tag_count = TagRepository::new()
+                .count_distinct_tags_for_billing_account(&db, &billing_account_update.id)
+                .await?;
 
             // Get existing tags for this link to see which ones are being removed
             let existing_link_tags = db::get_tags_for_link(&db, &link_id).await?;
@@ -1737,7 +1739,7 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
 
         // Validate and normalize tags (silently drop bad tags)
         let mut normalized_tags = if let Some(ref tags) = row.tags {
-            db::validate_and_normalize_tags(tags).unwrap_or_default()
+            validate_and_normalize_tags(tags).unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -1747,8 +1749,9 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
             && let Some(max_tags) = tier_limits.max_tags
         {
             // Get current count of distinct tags in the billing account
-            let current_tag_count =
-                db::count_distinct_tags_for_billing_account(&db, &billing_account.id).await?;
+            let current_tag_count = TagRepository::new()
+                .count_distinct_tags_for_billing_account(&db, &billing_account.id)
+                .await?;
 
             // Find which tags are new to the BA (not already in use)
             let mut new_tag_count = 0;
@@ -2282,7 +2285,9 @@ pub async fn handle_get_usage(req: Request, ctx: RouteContext<()>) -> Result<Res
         db::get_monthly_counter_for_billing_account(&db, &billing_account.id, &year_month).await?;
 
     // Get tag count for the billing account
-    let tags_count = db::count_distinct_tags_for_billing_account(&db, &billing_account.id).await?;
+    let tags_count = TagRepository::new()
+        .count_distinct_tags_for_billing_account(&db, &billing_account.id)
+        .await?;
 
     // Calculate next reset time (first day of next month at midnight UTC)
     let now = chrono::Utc::now();
@@ -2315,33 +2320,7 @@ pub async fn handle_get_usage(req: Request, ctx: RouteContext<()>) -> Result<Res
     Response::from_json(&usage)
 }
 
-#[utoipa::path(
-    get,
-    path = "/api/tags",
-    tag = "Tags",
-    summary = "List org tags",
-    description = "Returns all tags used within the authenticated organization, each with a usage count reflecting the number of active links carrying that tag",
-    responses(
-        (status = 200, description = "Array of tags with usage counts"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(
-        ("Bearer" = []),
-        ("session_cookie" = [])
-    )
-)]
-pub async fn handle_get_org_tags(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_ctx = match auth::authenticate_request(&req, &ctx).await {
-        Ok(ctx) => ctx,
-        Err(e) => return Ok(e.into_response()),
-    };
-    let org_id = &user_ctx.org_id;
-
-    let db = ctx.env.get_binding::<D1Database>("rushomon")?;
-    let tags = db::get_org_tags(&db, org_id).await?;
-
-    Response::from_json(&tags)
-}
+// Tag handlers moved to api/tags/
 
 #[utoipa::path(
     post,
@@ -4983,144 +4962,7 @@ fn extract_query_param(query: &str, name: &str) -> Result<String> {
         .ok_or_else(|| Error::RustError(format!("Missing {} parameter", name)))
 }
 
-// ─── Tag Management ─────────────────────────────────────────────────────────────
-
-#[utoipa::path(
-    delete,
-    path = "/api/tags/{name}",
-    tag = "Tags",
-    summary = "Delete a tag",
-    description = "Removes a tag from all links in the authenticated organization and deletes it",
-    params(
-        ("name" = String, Path, description = "Tag name"),
-    ),
-    responses(
-        (status = 204, description = "Tag deleted"),
-        (status = 401, description = "Unauthorized"),
-        (status = 500, description = "Failed to delete tag"),
-    ),
-    security(
-        ("Bearer" = []),
-        ("session_cookie" = [])
-    )
-)]
-pub async fn handle_delete_org_tag(req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_ctx = match auth::authenticate_request(&req, &ctx).await {
-        Ok(ctx) => ctx,
-        Err(e) => return Ok(e.into_response()),
-    };
-
-    let tag_name = match ctx.param("name") {
-        Some(name) => name.to_string(),
-        None => return Response::error("Missing tag name", 400),
-    };
-
-    let db = ctx.env.get_binding::<D1Database>("rushomon")?;
-
-    // Delete the tag from the organization
-    match db::delete_tag_for_org(&db, &user_ctx.org_id, &tag_name).await {
-        Ok(()) => Ok(Response::empty()?.with_status(204)),
-        Err(e) => {
-            console_log!(
-                "{}",
-                serde_json::json!({
-                    "event": "delete_tag_failed",
-                    "org_id": user_ctx.org_id,
-                    "tag_name": tag_name,
-                    "error": e.to_string(),
-                    "level": "error"
-                })
-            );
-            Response::error("Failed to delete tag", 500)
-        }
-    }
-}
-
-#[utoipa::path(
-    patch,
-    path = "/api/tags/{name}",
-    tag = "Tags",
-    summary = "Rename a tag",
-    description = "Renames a tag across all links in the authenticated organization. Returns the updated tag list",
-    params(
-        ("name" = String, Path, description = "Current tag name"),
-    ),
-    responses(
-        (status = 200, description = "Updated tag list"),
-        (status = 400, description = "Missing or invalid new tag name"),
-        (status = 401, description = "Unauthorized"),
-    ),
-    security(
-        ("Bearer" = []),
-        ("session_cookie" = [])
-    )
-)]
-pub async fn handle_rename_org_tag(mut req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let user_ctx = match auth::authenticate_request(&req, &ctx).await {
-        Ok(ctx) => ctx,
-        Err(e) => return Ok(e.into_response()),
-    };
-
-    let old_name = match ctx.param("name") {
-        Some(name) => name.to_string(),
-        None => return Response::error("Missing tag name", 400),
-    };
-
-    // Parse request body
-    let body: serde_json::Value = match req.json().await {
-        Ok(body) => body,
-        Err(_) => return Response::error("Invalid request body", 400),
-    };
-
-    let new_name = match body.get("new_name").and_then(|v| v.as_str()) {
-        Some(name) => name.to_string(),
-        None => return Response::error("Missing new_name field", 400),
-    };
-
-    // Validate and normalize the new tag name
-    let normalized_new_name = match db::normalize_tag(&new_name) {
-        Some(name) => name,
-        None => return Response::error("Invalid tag name", 400),
-    };
-
-    let db = ctx.env.get_binding::<D1Database>("rushomon")?;
-
-    // Rename the tag
-    match db::rename_tag_for_org(&db, &user_ctx.org_id, &old_name, &normalized_new_name).await {
-        Ok(()) => {
-            // Return updated tag list
-            match db::get_org_tags(&db, &user_ctx.org_id).await {
-                Ok(tags) => Response::from_json(&tags),
-                Err(e) => {
-                    console_log!(
-                        "{}",
-                        serde_json::json!({
-                            "event": "get_tags_after_rename_failed",
-                            "org_id": user_ctx.org_id,
-                            "error": e.to_string(),
-                            "level": "error"
-                        })
-                    );
-                    Response::error("Tag renamed but failed to fetch updated list", 500)
-                }
-            }
-        }
-        Err(e) => {
-            console_log!(
-                "{}",
-                serde_json::json!({
-                    "event": "rename_tag_failed",
-                    "org_id": user_ctx.org_id,
-                    "old_name": old_name,
-                    "new_name": normalized_new_name,
-                    "error": e.to_string(),
-                    "level": "error"
-                })
-            );
-            Response::error("Failed to rename tag", 500)
-        }
-    }
-}
+// Tag handlers moved to api/tags/
 
 #[utoipa::path(
     get,

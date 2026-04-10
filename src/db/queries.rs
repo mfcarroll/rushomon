@@ -2255,44 +2255,6 @@ pub async fn is_duplicate_report(
     Ok(count > 0)
 }
 
-// ─── Tag queries ─────────────────────────────────────────────────────────────
-
-/// Normalize a tag name: trim whitespace, collapse internal spaces, max 50 chars.
-/// Returns None if the result is empty.
-pub fn normalize_tag(tag: &str) -> Option<String> {
-    let normalized: String = tag.split_whitespace().collect::<Vec<&str>>().join(" ");
-    if normalized.is_empty() || normalized.len() > 50 {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
-/// Validate and normalize a list of tags. Returns error string if any tag is invalid.
-pub fn validate_and_normalize_tags(tags: &[String]) -> Result<Vec<String>> {
-    if tags.len() > 20 {
-        return Err(worker::Error::RustError(
-            "Maximum 20 tags per link".to_string(),
-        ));
-    }
-    let mut normalized = Vec::with_capacity(tags.len());
-    for tag in tags {
-        match normalize_tag(tag) {
-            Some(t) => normalized.push(t),
-            None => {
-                return Err(worker::Error::RustError(format!(
-                    "Invalid tag: '{}'. Tags must be non-empty and at most 50 characters.",
-                    tag
-                )));
-            }
-        }
-    }
-    // Deduplicate (case-insensitive)
-    let mut seen = std::collections::HashSet::new();
-    normalized.retain(|t| seen.insert(t.to_lowercase()));
-    Ok(normalized)
-}
-
 /// Get all tags for a single link, sorted alphabetically.
 pub async fn get_tags_for_link(db: &D1Database, link_id: &str) -> Result<Vec<String>> {
     let stmt =
@@ -2369,34 +2331,6 @@ pub async fn delete_tags_for_link(db: &D1Database, link_id: &str) -> Result<()> 
     let stmt = db.prepare("DELETE FROM link_tags WHERE link_id = ?1");
     stmt.bind(&[link_id.into()])?.run().await?;
     Ok(())
-}
-
-/// Get all tags for an org with usage counts, sorted by count desc then name asc.
-pub async fn get_org_tags(db: &D1Database, org_id: &str) -> Result<Vec<OrgTag>> {
-    let stmt = db.prepare(
-        "SELECT tag_name, COUNT(*) as count
-         FROM link_tags
-         WHERE org_id = ?1
-         GROUP BY tag_name
-         ORDER BY count DESC, tag_name ASC",
-    );
-    let results = stmt.bind(&[org_id.into()])?.all().await?;
-    let rows = results.results::<serde_json::Value>()?;
-    let tags = rows
-        .iter()
-        .filter_map(|row| {
-            let name = row["tag_name"].as_str()?.to_string();
-            let count = row["count"].as_f64()? as i64;
-            Some(OrgTag { name, count })
-        })
-        .collect();
-    Ok(tags)
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct OrgTag {
-    pub name: String,
-    pub count: i64,
 }
 
 // ─── Org Management ───────────────────────────────────────────────────────────
@@ -3581,68 +3515,6 @@ pub async fn get_cached_product_by_price_id(
         .await?;
 
     Ok(result)
-}
-
-// ─── Tag Management ─────────────────────────────────────────────────────────────
-
-/// Count distinct tag names across all organizations in a billing account.
-/// This is used to enforce BA-level tag limits.
-pub async fn count_distinct_tags_for_billing_account(
-    db: &D1Database,
-    billing_account_id: &str,
-) -> Result<i64> {
-    let stmt = db.prepare(
-        "SELECT COUNT(DISTINCT lt.tag_name) as count
-         FROM link_tags lt
-         JOIN organizations o ON lt.org_id = o.id
-         WHERE o.billing_account_id = ?1",
-    );
-
-    let result = stmt
-        .bind(&[billing_account_id.into()])?
-        .first::<serde_json::Value>(None)
-        .await?;
-
-    if let Some(result) = result {
-        Ok(result["count"].as_f64().unwrap_or(0.0) as i64)
-    } else {
-        Ok(0)
-    }
-}
-
-/// Rename a tag within an organization. Updates all links that use the tag.
-/// If the new name already exists in the org, this will effectively merge the tags.
-pub async fn rename_tag_for_org(
-    db: &D1Database,
-    org_id: &str,
-    old_name: &str,
-    new_name: &str,
-) -> Result<()> {
-    // Use INSERT OR REPLACE to handle the case where new_name already exists
-    // This effectively merges the old tag into the existing one
-    let stmt = db.prepare(
-        "UPDATE link_tags
-         SET tag_name = ?1
-         WHERE org_id = ?2 AND tag_name = ?3",
-    );
-
-    stmt.bind(&[new_name.into(), org_id.into(), old_name.into()])?
-        .run()
-        .await?;
-
-    Ok(())
-}
-
-/// Delete a tag from an organization. Removes the tag from all links.
-pub async fn delete_tag_for_org(db: &D1Database, org_id: &str, tag_name: &str) -> Result<()> {
-    let stmt = db.prepare(
-        "DELETE FROM link_tags
-         WHERE org_id = ?1 AND tag_name = ?2",
-    );
-
-    stmt.bind(&[org_id.into(), tag_name.into()])?.run().await?;
-
-    Ok(())
 }
 
 // ─── Webhook Idempotency ─────────────────────────────────────────────────────
