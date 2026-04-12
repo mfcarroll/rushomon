@@ -1,6 +1,9 @@
 export default {
   plugins: {
-    tailwindcss: {},
-    autoprefixer: {}
+    "postcss-import": {
+      filter: (path) =>
+        path !== "tailwindcss" && !path.startsWith("tailwindcss/")
+    },
+    "@tailwindcss/postcss": {}
   }
 };
