@@ -1,15 +1,16 @@
 use crate::auth;
 use crate::db;
+use crate::db::queries::get_code_length_settings;
 use crate::kv;
+use crate::kv::links::short_code_exists;
 use crate::models::{
     Tier,
     link::{Link, LinkStatus},
 };
 use crate::repositories::tag_repository::validate_and_normalize_tags;
-use crate::repositories::{LinkRepository, TagRepository};
+use crate::repositories::{LinkRepository, SettingsRepository, TagRepository};
 use crate::utils::{
-    generate_short_code_with_length, now_timestamp,
-    short_code::{DEFAULT_COLLISION_THRESHOLD},
+    generate_short_code_with_length, now_timestamp, short_code::DEFAULT_COLLISION_THRESHOLD,
     validate_short_code, validate_url,
 };
 use chrono::Datelike;
@@ -75,7 +76,7 @@ async fn generate_progressive_short_code(
     loop {
         let code = generate_short_code_with_length(current_length);
 
-        if !crate::kv::links::short_code_exists(kv, &code).await? {
+        if !short_code_exists(kv, &code).await? {
             return Ok(code);
         }
 
@@ -87,7 +88,7 @@ async fn generate_progressive_short_code(
             current_length += 1;
             current_length_attempts = 0;
 
-            let settings_repo = crate::repositories::SettingsRepository::new();
+            let settings_repo = SettingsRepository::new();
             let _ = settings_repo
                 .set_setting(db, "system_min_code_length", &current_length.to_string())
                 .await;
@@ -170,10 +171,7 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
         format!("{}-{:02}", dt.year(), dt.month())
     };
 
-    let min_length = crate::db::queries::get_min_random_code_length(&db).await?;
-    let system_min_length = crate::db::queries::get_system_min_code_length(&db).await?;
-    let min_custom_length = crate::db::queries::get_min_custom_code_length(&db).await?;
-    let effective_custom_min = min_custom_length.max(system_min_length);
+    let lengths = get_code_length_settings(&db).await?;
 
     let mut created: usize = 0;
     let mut skipped: usize = 0;
@@ -242,14 +240,14 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
                 continue;
             }
 
-            if provided_code.len() < effective_custom_min {
+            if provided_code.len() < lengths.effective_custom_min {
                 skipped += 1;
                 errors.push(ImportError {
                     row: row_num,
                     destination_url: destination_url.clone(),
                     reason: format!(
                         "Custom short code must be at least {} characters",
-                        effective_custom_min
+                        lengths.effective_custom_min
                     ),
                 });
                 continue;
@@ -262,7 +260,7 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
                 } else {
                     format!("{}-{}", provided_code, attempt)
                 };
-                if !kv::links::short_code_exists(&kv, &candidate).await? {
+                if !short_code_exists(&kv, &candidate).await? {
                     resolved = Some(candidate);
                     break;
                 }
@@ -276,8 +274,8 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
                         &kv,
                         &db,
                         &ctx.env,
-                        min_length,
-                        system_min_length,
+                        lengths.min_length,
+                        lengths.system_min_length,
                     )
                     .await
                     {
@@ -306,8 +304,14 @@ pub async fn handle_import_links(mut req: Request, ctx: RouteContext<()>) -> Res
                 }
             }
         } else {
-            match generate_progressive_short_code(&kv, &db, &ctx.env, min_length, system_min_length)
-                .await
+            match generate_progressive_short_code(
+                &kv,
+                &db,
+                &ctx.env,
+                lengths.min_length,
+                lengths.system_min_length,
+            )
+            .await
             {
                 Ok(c) => short_code = c,
                 Err(_) => {

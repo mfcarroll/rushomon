@@ -1,16 +1,17 @@
 use crate::auth;
 use crate::db;
+use crate::db::queries::get_code_length_settings;
 use crate::kv;
+use crate::kv::links::short_code_exists;
 use crate::middleware::{RateLimitConfig, RateLimiter};
 use crate::models::{
     Tier,
     link::{CreateLinkRequest, Link, LinkStatus},
 };
 use crate::repositories::tag_repository::validate_and_normalize_tags;
-use crate::repositories::{LinkRepository, TagRepository};
+use crate::repositories::{LinkRepository, SettingsRepository, TagRepository};
 use crate::utils::{
-    generate_short_code_with_length, now_timestamp,
-    short_code::{DEFAULT_COLLISION_THRESHOLD},
+    generate_short_code_with_length, now_timestamp, short_code::DEFAULT_COLLISION_THRESHOLD,
     validate_short_code, validate_url,
 };
 use chrono::Datelike;
@@ -39,7 +40,7 @@ async fn generate_progressive_short_code(
     loop {
         let code = generate_short_code_with_length(current_length);
 
-        if !crate::kv::links::short_code_exists(kv, &code).await? {
+        if !short_code_exists(kv, &code).await? {
             return Ok(code);
         }
 
@@ -51,7 +52,7 @@ async fn generate_progressive_short_code(
             current_length += 1;
             current_length_attempts = 0;
 
-            let settings_repo = crate::repositories::SettingsRepository::new();
+            let settings_repo = SettingsRepository::new();
             let _ = settings_repo
                 .set_setting(db, "system_min_code_length", &current_length.to_string())
                 .await;
@@ -270,12 +271,7 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
         return Response::error(error_msg, 403);
     }
 
-    let min_random_length = crate::db::queries::get_min_random_code_length(&db).await?;
-    let min_custom_length = crate::db::queries::get_min_custom_code_length(&db).await?;
-    let system_min_length = crate::db::queries::get_system_min_code_length(&db).await?;
-
-    // Custom codes must respect the higher of the custom rule or system physical floor
-    let effective_custom_min = min_custom_length.max(system_min_length);
+    let lengths = get_code_length_settings(&db).await?;
 
     let kv = ctx.kv("URL_MAPPINGS")?;
 
@@ -287,24 +283,30 @@ pub async fn handle_create_link(mut req: Request, ctx: RouteContext<()>) -> Resu
             }
         };
 
-        if custom_code.len() < effective_custom_min {
+        if custom_code.len() < lengths.effective_custom_min {
             return Response::error(
                 format!(
                     "Custom short code must be at least {} characters",
-                    effective_custom_min
+                    lengths.effective_custom_min
                 ),
                 400,
             );
         }
 
-        if crate::kv::links::short_code_exists(&kv, &custom_code).await? {
+        if short_code_exists(&kv, &custom_code).await? {
             return Response::error("Short code already in use", 409);
         }
 
         custom_code
     } else {
-        generate_progressive_short_code(&kv, &db, &ctx.env, min_random_length, system_min_length)
-            .await?
+        generate_progressive_short_code(
+            &kv,
+            &db,
+            &ctx.env,
+            lengths.min_random_length,
+            lengths.system_min_length,
+        )
+        .await?
     };
 
     let normalized_tags = if let Some(tags) = body.tags {

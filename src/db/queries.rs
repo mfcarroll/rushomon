@@ -1,7 +1,10 @@
 use crate::models::{BillingAccount, Link, Organization, User, user::CreateUserData};
+use crate::repositories::SettingsRepository;
 use crate::repositories::link_repository::{AdminLink, serialize_optional_int_as_bool};
 use crate::utils::now_timestamp;
-use crate::utils::short_code::DEFAULT_SYSTEM_MIN_CODE_LENGTH;
+use crate::utils::short_code::{
+    DEFAULT_MIN_CUSTOM_CODE_LENGTH, DEFAULT_MIN_RANDOM_CODE_LENGTH, DEFAULT_SYSTEM_MIN_CODE_LENGTH,
+};
 use wasm_bindgen::JsValue;
 use worker::d1::D1Database;
 use worker::*;
@@ -184,7 +187,7 @@ pub async fn create_default_org(
     let now = now_timestamp();
 
     // Read the default tier from settings
-    let settings_repo = crate::repositories::SettingsRepository::new();
+    let settings_repo = SettingsRepository::new();
     let tier = settings_repo
         .get_setting(db, "default_user_tier")
         .await?
@@ -332,13 +335,43 @@ pub async fn get_all_users(db: &D1Database, limit: i64, offset: i64) -> Result<V
 // suspend_user, unsuspend_user, delete_user, get_links_by_creator, get_links_by_org,
 // is_last_admin_in_org moved to UserRepository
 
-/// Helper to fetch the current code length high watermark
-pub async fn get_system_min_code_length(db: &D1Database) -> Result<usize> {
-    let settings_repo = crate::repositories::SettingsRepository::new();
-    Ok(settings_repo.get_setting(db, "system_min_code_length")
-        .await?
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct CodeLengthSettings {
+    pub min_length: usize,        // min_random_code_length (used in import)
+    pub min_random_length: usize, // min_random_code_length (used in create)
+    pub custom_min: usize,        // min_custom_code_length
+    pub system_min_length: usize, // system_min_code_length (watermark)
+    pub effective_custom_min: usize,
+}
+
+/// Fetches all code length related settings and calculates effective limits
+pub async fn get_code_length_settings(db: &D1Database) -> Result<CodeLengthSettings> {
+    // Restoring your single-query performance optimization!
+    let settings_repo = SettingsRepository::new();
+    let settings = settings_repo.get_all_settings(db).await?;
+
+    let min_random = settings
+        .get("min_random_code_length")
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SYSTEM_MIN_CODE_LENGTH))
+        .unwrap_or(DEFAULT_MIN_RANDOM_CODE_LENGTH);
+
+    let min_custom = settings
+        .get("min_custom_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_CUSTOM_CODE_LENGTH);
+
+    let system_min = settings
+        .get("system_min_code_length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SYSTEM_MIN_CODE_LENGTH);
+
+    Ok(CodeLengthSettings {
+        min_length: min_random,
+        min_random_length: min_random,
+        custom_min: min_custom,
+        system_min_length: system_min,
+        effective_custom_min: min_custom.max(system_min),
+    })
 }
 
 #[cfg(test)]
