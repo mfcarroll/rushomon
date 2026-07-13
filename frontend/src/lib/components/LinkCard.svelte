@@ -92,8 +92,20 @@
     return new Date(timestamp * 1000).toLocaleDateString();
   }
 
-  // Extract domain from URL for cleaner display
+  const isEmailLink = $derived(
+    link.destination_url.toLowerCase().startsWith("mailto:")
+  );
+
+  // Extract a clean display label from the destination URL.
   function getDomain(url: string): string {
+    if (url.toLowerCase().startsWith("mailto:")) {
+      const address = url.slice("mailto:".length).split("?")[0].split(",")[0];
+      try {
+        return decodeURIComponent(address) || "email";
+      } catch {
+        return address || "email";
+      }
+    }
     try {
       const urlObj = new URL(url);
       return urlObj.hostname.replace("www.", "");
@@ -145,10 +157,26 @@
             href={link.destination_url}
             target="_blank"
             rel="noopener noreferrer"
-            class="text-gray-600 hover:text-gray-900 hover:underline truncate"
+            class="flex items-center gap-1 text-gray-600 hover:text-gray-900 hover:underline truncate"
             title={link.destination_url}
           >
-            {getDomain(link.destination_url)}
+            {#if isEmailLink}
+              <svg
+                class="w-3.5 h-3.5 text-gray-400 flex-shrink-0"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+                />
+              </svg>
+            {/if}
+            <span class="truncate">{getDomain(link.destination_url)}</span>
           </a>
         </div>
       </div>

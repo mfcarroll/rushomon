@@ -13,11 +13,14 @@
   } from "$lib/types/api";
   import { debounce, fetchUrlTitle } from "$lib/utils/url-title";
   import { backdropClose } from "$lib/actions/backdropClose";
+  import { buildMailto, isMailto, parseMailto } from "$lib/utils/mailto";
   import {
     DEFAULT_MIN_CUSTOM_CODE_LENGTH,
     MAX_SHORT_CODE_LENGTH
   } from "$lib/constants";
   import { createEventDispatcher, onMount } from "svelte";
+
+  type LinkType = "web" | "email";
 
   interface Props {
     link?: Link | null;
@@ -60,8 +63,17 @@
   );
 
   // Form state
+  let linkType = $state<LinkType>("web");
   let destinationUrl = $state("");
   let shortCode = $state("");
+
+  // Email (mailto) composer state
+  let emailTo = $state("");
+  let emailSubject = $state("");
+  let emailBody = $state("");
+  let emailCc = $state("");
+  let emailBcc = $state("");
+  let showEmailCcBcc = $state(false);
   let title = $state("");
   let expiresAt = $state("");
   let status = $state<LinkStatus>("active");
@@ -129,6 +141,11 @@
   let error = $state("");
   let isFetchingTitle = $state(false);
   let hasUserEnteredTitle = $state(false);
+  // The last title we set programmatically (fetch or email suggestion). Used to
+  // tell a genuine user edit apart from our own assignment: binding a
+  // programmatic `title` change can still fire the input's oninput, so we only
+  // treat it as user input when the field value diverges from this.
+  let autoTitle = $state("");
   let availableTags = $state<TagWithCount[]>([]);
 
   onMount(async () => {
@@ -156,7 +173,14 @@
 
   // Reset form fields
   function resetForm() {
+    linkType = "web";
     destinationUrl = "";
+    emailTo = "";
+    emailSubject = "";
+    emailBody = "";
+    emailCc = "";
+    emailBcc = "";
+    showEmailCcBcc = false;
     shortCode = "";
     title = "";
     expiresAt = "";
@@ -165,6 +189,7 @@
     error = "";
     isFetchingTitle = false;
     hasUserEnteredTitle = false;
+    autoTitle = "";
     utmSource = "";
     utmMedium = "";
     utmCampaign = "";
@@ -192,8 +217,22 @@
       if (link && link.id !== populatedLinkId) {
         // Edit mode: populate with link data (only if not already populated)
         destinationUrl = link.destination_url;
+        // Email links open in Email mode with the composer fields populated.
+        if (isMailto(link.destination_url)) {
+          linkType = "email";
+          const parts = parseMailto(link.destination_url);
+          emailTo = parts.to;
+          emailSubject = parts.subject;
+          emailBody = parts.body;
+          emailCc = parts.cc;
+          emailBcc = parts.bcc;
+          showEmailCcBcc = !!(parts.cc || parts.bcc);
+        } else {
+          linkType = "web";
+        }
         shortCode = link.short_code;
         title = link.title || "";
+        autoTitle = title;
         expiresAt = link.expires_at
           ? (() => {
               const date = new Date(link.expires_at * 1000);
@@ -253,46 +292,75 @@
     error = "";
 
     try {
-      const utmParams: UtmParams | undefined = allowUtmParameters
-        ? {
-            utm_source: utmSource.trim() || undefined,
-            utm_medium: utmMedium.trim() || undefined,
-            utm_campaign: utmCampaign.trim() || undefined,
-            utm_term: utmTerm.trim() || undefined,
-            utm_content: utmContent.trim() || undefined,
-            utm_ref: utmRef.trim() || undefined
-          }
-        : undefined;
+      const isEmail = linkType === "email";
+
+      // In Email mode, serialise the composer fields into a mailto: URL.
+      // UTM tagging, query forwarding, redirect type, and device routing don't
+      // apply to mailto destinations, so they are omitted.
+      let destination: string;
+      if (isEmail) {
+        // The recipient is optional, but the email must contain something.
+        const hasContent =
+          emailTo.trim() ||
+          emailSubject.trim() ||
+          emailBody.trim() ||
+          emailCc.trim() ||
+          emailBcc.trim();
+        if (!hasContent) {
+          error = "Enter a recipient, subject, or message for the email.";
+          return;
+        }
+        destination = buildMailto({
+          to: emailTo,
+          subject: emailSubject,
+          body: emailBody,
+          cc: emailCc,
+          bcc: emailBcc
+        });
+      } else {
+        destination = destinationUrl.trim();
+      }
+
+      const utmParams: UtmParams | undefined =
+        !isEmail && allowUtmParameters
+          ? {
+              utm_source: utmSource.trim() || undefined,
+              utm_medium: utmMedium.trim() || undefined,
+              utm_campaign: utmCampaign.trim() || undefined,
+              utm_term: utmTerm.trim() || undefined,
+              utm_content: utmContent.trim() || undefined,
+              utm_ref: utmRef.trim() || undefined
+            }
+          : undefined;
 
       // TODO: Review in the future if we can avoid this
 
       let linkData: CreateLinkRequest & Partial<UpdateLinkRequest> = {
-        destination_url: destinationUrl.trim(),
+        destination_url: destination,
         title: title.trim() || undefined,
         tags: tags.length > 0 ? tags : undefined,
         utm_params: utmParams,
-        forward_query_params: allowQueryForwarding
-          ? forwardQueryParams
-          : undefined,
+        forward_query_params:
+          !isEmail && allowQueryForwarding ? forwardQueryParams : undefined,
         redirect_type: redirectType
       };
 
-      // Handle device URLs: set, clear, or don't update
-      if (iosUrl.trim()) {
+      // Handle device URLs: set, clear, or don't update (web links only).
+      if (!isEmail && iosUrl.trim()) {
         linkData.ios_url = iosUrl.trim();
       } else if (link?.ios_url) {
         // Send clear_ios_url flag to explicitly clear iOS URL
         linkData.clear_ios_url = true;
       }
 
-      if (androidUrl.trim()) {
+      if (!isEmail && androidUrl.trim()) {
         linkData.android_url = androidUrl.trim();
       } else if (link?.android_url) {
         // Send clear_android_url flag to explicitly clear Android URL
         linkData.clear_android_url = true;
       }
 
-      if (desktopUrl.trim()) {
+      if (!isEmail && desktopUrl.trim()) {
         linkData.desktop_url = desktopUrl.trim();
       } else if (link?.desktop_url) {
         // Send clear_desktop_url flag to explicitly clear Desktop URL
@@ -368,6 +436,7 @@
       // Only set the title if user hasn't entered one and we got a valid title
       if (!hasUserEnteredTitle && fetchedTitle) {
         title = fetchedTitle;
+        autoTitle = fetchedTitle;
       }
     } catch (err) {
       // Silently handle errors - title fetching is optional
@@ -384,11 +453,32 @@
     }
   });
 
-  // Handle manual title changes
+  // Auto-switch to Email mode when a mailto: URL is typed or pasted into the
+  // web destination field, parsing it into the composer fields.
   $effect(() => {
-    // Mark that user has entered a title if it's not empty
-    if (title.trim()) {
-      hasUserEnteredTitle = true;
+    if (linkType === "web" && isMailto(destinationUrl)) {
+      const parts = parseMailto(destinationUrl);
+      emailTo = parts.to;
+      emailSubject = parts.subject;
+      emailBody = parts.body;
+      emailCc = parts.cc;
+      emailBcc = parts.bcc;
+      showEmailCcBcc = !!(parts.cc || parts.bcc);
+      destinationUrl = "";
+      linkType = "email";
+    }
+  });
+
+  // Suggest a title for email links: the subject if present, otherwise the
+  // first recipient. Runs while the title is still auto-managed; once the user
+  // edits the title field (see the input's oninput), hasUserEnteredTitle stays
+  // true and this stops — including if they deliberately blank it out.
+  $effect(() => {
+    if (linkType === "email" && !isEditMode && !hasUserEnteredTitle) {
+      const suggested =
+        emailSubject.trim() || emailTo.split(",")[0]?.trim() || "";
+      title = suggested;
+      autoTitle = suggested;
     }
   });
 </script>
@@ -446,24 +536,191 @@
           </div>
         {/if}
 
-        <!-- Destination URL -->
+        <!-- Link Type Selector -->
         <div>
-          <label
-            for="destination-url"
-            class="block text-sm font-medium text-gray-700 mb-2"
+          <span class="block text-sm font-medium text-gray-700 mb-2"
+            >Link type</span
           >
-            Destination URL <span class="text-red-500">*</span>
-          </label>
-          <input
-            id="destination-url"
-            type="url"
-            bind:value={destinationUrl}
-            required
-            placeholder="https://example.com/very/long/url"
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
-            disabled={loading}
-          />
+          <div
+            class="inline-flex rounded-lg border border-gray-300 bg-gray-50 p-0.5"
+            role="group"
+          >
+            <button
+              type="button"
+              onclick={() => (linkType = "web")}
+              disabled={loading}
+              class="flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-md transition-colors {linkType ===
+              'web'
+                ? 'bg-white text-orange-600 shadow-sm'
+                : 'text-gray-500 hover:text-gray-700'}"
+            >
+              <svg
+                class="w-4 h-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"
+                />
+              </svg>
+              Web
+            </button>
+            <button
+              type="button"
+              onclick={() => (linkType = "email")}
+              disabled={loading}
+              class="flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-md transition-colors {linkType ===
+              'email'
+                ? 'bg-white text-orange-600 shadow-sm'
+                : 'text-gray-500 hover:text-gray-700'}"
+            >
+              <svg
+                class="w-4 h-4"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+                />
+              </svg>
+              Email
+            </button>
+          </div>
         </div>
+
+        {#if linkType === "web"}
+          <!-- Destination URL -->
+          <div>
+            <label
+              for="destination-url"
+              class="block text-sm font-medium text-gray-700 mb-2"
+            >
+              Destination URL <span class="text-red-500">*</span>
+            </label>
+            <input
+              id="destination-url"
+              type="url"
+              bind:value={destinationUrl}
+              required
+              placeholder="https://example.com/very/long/url"
+              class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+              disabled={loading}
+            />
+          </div>
+        {:else}
+          <!-- Email Composer -->
+          <div class="space-y-4">
+            <!-- To -->
+            <div>
+              <label
+                for="email-to"
+                class="block text-sm font-medium text-gray-700 mb-2"
+              >
+                To
+              </label>
+              <input
+                id="email-to"
+                type="text"
+                bind:value={emailTo}
+                placeholder="hello@example.com, sales@example.com"
+                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                disabled={loading}
+              />
+              <p class="text-xs text-gray-500 mt-1">
+                Separate multiple addresses with commas
+              </p>
+            </div>
+
+            <!-- Cc / Bcc -->
+            {#if showEmailCcBcc}
+              <div>
+                <label
+                  for="email-cc"
+                  class="block text-sm font-medium text-gray-700 mb-2"
+                >
+                  Cc
+                </label>
+                <input
+                  id="email-cc"
+                  type="text"
+                  bind:value={emailCc}
+                  placeholder="cc@example.com"
+                  class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                  disabled={loading}
+                />
+              </div>
+              <div>
+                <label
+                  for="email-bcc"
+                  class="block text-sm font-medium text-gray-700 mb-2"
+                >
+                  Bcc
+                </label>
+                <input
+                  id="email-bcc"
+                  type="text"
+                  bind:value={emailBcc}
+                  placeholder="bcc@example.com"
+                  class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                  disabled={loading}
+                />
+              </div>
+            {:else}
+              <button
+                type="button"
+                onclick={() => (showEmailCcBcc = true)}
+                disabled={loading}
+                class="text-sm font-medium text-orange-600 hover:text-orange-700 hover:underline"
+              >
+                + Add Cc/Bcc
+              </button>
+            {/if}
+
+            <!-- Subject -->
+            <div>
+              <label
+                for="email-subject"
+                class="block text-sm font-medium text-gray-700 mb-2"
+              >
+                Subject
+              </label>
+              <input
+                id="email-subject"
+                type="text"
+                bind:value={emailSubject}
+                placeholder="Question about your services"
+                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                disabled={loading}
+              />
+            </div>
+
+            <!-- Body -->
+            <div>
+              <label
+                for="email-body"
+                class="block text-sm font-medium text-gray-700 mb-2"
+              >
+                Body
+              </label>
+              <textarea
+                id="email-body"
+                bind:value={emailBody}
+                rows="3"
+                placeholder="Pre-filled message body…"
+                class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+                disabled={loading}
+              ></textarea>
+            </div>
+          </div>
+        {/if}
 
         <!-- Domain Selection -->
         {#if activeDomains.length > 0 || (isEditMode && link?.custom_domain)}
@@ -573,6 +830,10 @@
             id="title"
             type="text"
             bind:value={title}
+            oninput={(e) => {
+              if (e.currentTarget.value !== autoTitle)
+                hasUserEnteredTitle = true;
+            }}
             placeholder="My Awesome Link"
             maxlength="200"
             class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
@@ -599,52 +860,59 @@
             </p>
           {:else if hasUserEnteredTitle}
             <p class="text-xs text-gray-500 mt-1">Custom title entered</p>
-          {:else if !isEditMode}
+          {:else if !isEditMode && linkType === "web"}
             <p class="text-xs text-gray-500 mt-1">
               Title will be fetched automatically
+            </p>
+          {:else if !isEditMode}
+            <p class="text-xs text-gray-500 mt-1">
+              Suggested from the subject or recipient — edit or clear to
+              customise
             </p>
           {:else}
             <p class="text-xs text-gray-500 mt-1">Edit title manually</p>
           {/if}
         </div>
 
-        <!-- Redirect Type -->
-        <div>
-          <label
-            for="redirect-type"
-            class="block text-sm font-medium text-gray-700 mb-2 flex items-center gap-2"
-          >
-            Redirect Type
-            {#if !isProOrAbove}
-              <span
-                class="px-2 py-0.5 text-xs font-medium bg-orange-100 text-orange-700 rounded-full"
-                >Pro</span
-              >
-            {/if}
-          </label>
-          <select
-            id="redirect-type"
-            bind:value={redirectType}
-            disabled={loading || !isProOrAbove}
-            class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
-          >
-            <option value="301">301 - Permanent (SEO Optimized)</option>
-            {#if isProOrAbove}
-              <option value="307">307 - Temporary (Better Tracking)</option>
-            {/if}
-          </select>
-          <p class="text-xs text-gray-500 mt-1">
-            {#if !isProOrAbove}
-              <a
-                href="/pricing"
-                class="text-orange-600 hover:text-orange-700 hover:underline"
-                >Upgrade to Pro</a
-              > to use temporary redirects (307)
-            {:else}
-              301 for SEO benefits, 307 to avoid browser caching
-            {/if}
-          </p>
-        </div>
+        <!-- Redirect Type (web links only) -->
+        {#if linkType === "web"}
+          <div>
+            <label
+              for="redirect-type"
+              class="block text-sm font-medium text-gray-700 mb-2 flex items-center gap-2"
+            >
+              Redirect Type
+              {#if !isProOrAbove}
+                <span
+                  class="px-2 py-0.5 text-xs font-medium bg-orange-100 text-orange-700 rounded-full"
+                  >Pro</span
+                >
+              {/if}
+            </label>
+            <select
+              id="redirect-type"
+              bind:value={redirectType}
+              disabled={loading || !isProOrAbove}
+              class="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
+            >
+              <option value="301">301 - Permanent (SEO Optimized)</option>
+              {#if isProOrAbove}
+                <option value="307">307 - Temporary (Better Tracking)</option>
+              {/if}
+            </select>
+            <p class="text-xs text-gray-500 mt-1">
+              {#if !isProOrAbove}
+                <a
+                  href="/pricing"
+                  class="text-orange-600 hover:text-orange-700 hover:underline"
+                  >Upgrade to Pro</a
+                > to use temporary redirects (307)
+              {:else}
+                301 for SEO benefits, 307 to avoid browser caching
+              {/if}
+            </p>
+          </div>
+        {/if}
 
         <!-- Expiration Date -->
         <div>
@@ -693,20 +961,45 @@
           />
         </div>
 
-        <!-- Pro Features: UTM Builder + Query Forwarding -->
-        {#if allowUtmParameters || allowQueryForwarding}
-          <!-- UTM Builder -->
-          {#if allowUtmParameters}
-            <div class="border border-gray-200 rounded-lg overflow-hidden">
-              <button
-                type="button"
-                class="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-sm font-medium text-gray-700"
-                onclick={() => (showUtmBuilder = !showUtmBuilder)}
-                disabled={loading}
-              >
-                <span class="flex items-center gap-2">
+        <!-- Advanced routing options apply to web links only -->
+        {#if linkType === "web"}
+          <!-- Pro Features: UTM Builder + Query Forwarding -->
+          {#if allowUtmParameters || allowQueryForwarding}
+            <!-- UTM Builder -->
+            {#if allowUtmParameters}
+              <div class="border border-gray-200 rounded-lg overflow-hidden">
+                <button
+                  type="button"
+                  class="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-sm font-medium text-gray-700"
+                  onclick={() => (showUtmBuilder = !showUtmBuilder)}
+                  disabled={loading}
+                >
+                  <span class="flex items-center gap-2">
+                    <svg
+                      class="w-4 h-4 text-indigo-500"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        stroke-width="2"
+                        d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"
+                      />
+                    </svg>
+                    UTM Parameters
+                    {#if hasUtmParams}
+                      <span
+                        class="bg-indigo-100 text-indigo-700 text-xs px-2 py-0.5 rounded-full"
+                        >active</span
+                      >
+                    {/if}
+                  </span>
                   <svg
-                    class="w-4 h-4 text-indigo-500"
+                    class="w-4 h-4 text-gray-400 transition-transform {showUtmBuilder
+                      ? 'rotate-180'
+                      : ''}"
                     fill="none"
                     stroke="currentColor"
                     viewBox="0 0 24 24"
@@ -715,19 +1008,338 @@
                       stroke-linecap="round"
                       stroke-linejoin="round"
                       stroke-width="2"
-                      d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"
+                      d="M19 9l-7 7-7-7"
                     />
                   </svg>
-                  UTM Parameters
-                  {#if hasUtmParams}
+                </button>
+                {#if showUtmBuilder}
+                  <div class="p-4 space-y-3 border-t border-gray-200">
+                    <p class="text-xs text-gray-500 mb-4">
+                      Appended to the destination URL on every redirect.
+                    </p>
+                    <div class="space-y-3">
+                      <!-- Source -->
+                      <div class="flex items-center gap-3">
+                        <div
+                          class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        >
+                          <svg
+                            class="w-4 h-4 text-gray-600"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                            />
+                          </svg>
+                        </div>
+                        <label
+                          for="modal-utm-source"
+                          class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                          >Source</label
+                        >
+                        <input
+                          type="text"
+                          id="modal-utm-source"
+                          bind:value={utmSource}
+                          placeholder="e.g. newsletter"
+                          disabled={loading}
+                          class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
+                        />
+                      </div>
+
+                      <!-- Medium -->
+                      <div class="flex items-center gap-3">
+                        <div
+                          class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        >
+                          <svg
+                            class="w-4 h-4 text-gray-600"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z"
+                            />
+                          </svg>
+                        </div>
+                        <label
+                          for="modal-utm-medium"
+                          class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                          >Medium</label
+                        >
+                        <input
+                          type="text"
+                          id="modal-utm-medium"
+                          bind:value={utmMedium}
+                          placeholder="e.g. email"
+                          disabled={loading}
+                          class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
+                        />
+                      </div>
+
+                      <!-- Campaign -->
+                      <div class="flex items-center gap-3">
+                        <div
+                          class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        >
+                          <svg
+                            class="w-4 h-4 text-gray-600"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"
+                            />
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"
+                            />
+                          </svg>
+                        </div>
+                        <label
+                          for="modal-utm-campaign"
+                          class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                          >Campaign</label
+                        >
+                        <input
+                          type="text"
+                          id="modal-utm-campaign"
+                          bind:value={utmCampaign}
+                          placeholder="e.g. spring_sale"
+                          disabled={loading}
+                          class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
+                        />
+                      </div>
+
+                      <!-- Term -->
+                      <div class="flex items-center gap-3">
+                        <div
+                          class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        >
+                          <svg
+                            class="w-4 h-4 text-gray-600"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+                            />
+                          </svg>
+                        </div>
+                        <label
+                          for="modal-utm-term"
+                          class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                          >Term</label
+                        >
+                        <input
+                          type="text"
+                          id="modal-utm-term"
+                          bind:value={utmTerm}
+                          placeholder="e.g. running+shoes"
+                          disabled={loading}
+                          class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
+                        />
+                      </div>
+
+                      <!-- Content -->
+                      <div class="flex items-center gap-3">
+                        <div
+                          class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        >
+                          <svg
+                            class="w-4 h-4 text-gray-600"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                            />
+                          </svg>
+                        </div>
+                        <label
+                          for="modal-utm-content"
+                          class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                          >Content</label
+                        >
+                        <input
+                          type="text"
+                          id="modal-utm-content"
+                          bind:value={utmContent}
+                          placeholder="e.g. banner_top"
+                          disabled={loading}
+                          class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
+                        />
+                      </div>
+
+                      <!-- Ref -->
+                      <div class="flex items-center gap-3">
+                        <div
+                          class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                        >
+                          <svg
+                            class="w-4 h-4 text-gray-600"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              stroke-width="2"
+                              d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m9.032 4.026a9.001 9.001 0 01-7.432 0m9.032-4.026A9.001 9.001 0 0112 3c-4.474 0-8.268 3.12-9.032 7.326M15 12a3 3 0 11-6 0 3 3 0 016 0z"
+                            />
+                          </svg>
+                        </div>
+                        <label
+                          for="modal-utm-ref"
+                          class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                          >Referral</label
+                        >
+                        <input
+                          type="text"
+                          id="modal-utm-ref"
+                          bind:value={utmRef}
+                          placeholder="e.g. affiliate123"
+                          disabled={loading}
+                          class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
+                        />
+                      </div>
+                    </div>
+
+                    <!-- URL Preview -->
+                    {#if destinationUrl && hasUtmParams}
+                      <div class="px-4 pb-4">
+                        <div
+                          class="text-sm font-medium text-gray-700 mb-1 block"
+                        >
+                          URL Preview
+                        </div>
+                        <div
+                          class="p-3 bg-gray-50 rounded-lg border border-gray-200"
+                        >
+                          {@html `<p class="text-xs font-mono text-gray-600 break-all">${buildPreviewUrl()}</p>`}
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+
+            <!-- Forward Query Params Toggle -->
+            {#if allowQueryForwarding}
+              <div
+                class="flex items-start gap-3 p-4 border border-gray-200 rounded-lg"
+              >
+                <div class="flex-1">
+                  <label
+                    for="modal-forward-query-params"
+                    class="block text-sm font-medium text-gray-700"
+                  >
+                    Forward visitor query parameters
+                  </label>
+                  <p class="text-xs text-gray-500 mt-0.5">
+                    Appends query params from the short link URL to the
+                    destination (e.g. <code class="bg-gray-100 px-1 rounded"
+                      >?ref=tw</code
+                    > passes through). Visitor params override UTM params on conflict.
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  id="modal-forward-query-params"
+                  bind:checked={forwardQueryParams}
+                  disabled={loading}
+                  class="mt-0.5 h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
+                />
+              </div>
+            {/if}
+          {/if}
+
+          <!-- Show upsell if neither feature is available -->
+          {#if !allowUtmParameters && !allowQueryForwarding}
+            <div
+              class="flex items-center gap-2 p-3 bg-gray-50 border border-dashed border-gray-300 rounded-lg text-sm text-gray-500"
+            >
+              <svg
+                class="w-4 h-4 text-amber-500 shrink-0"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="2"
+                  d="M13 10V3L4 14h7v7l9-11h-7z"
+                />
+              </svg>
+              <span
+                ><strong class="text-gray-700">Pro feature:</strong>
+                UTM parameters &amp; query forwarding —
+                <a href="/pricing" class="text-orange-600 hover:underline"
+                  >Upgrade to Pro</a
+                ></span
+              >
+            </div>
+          {/if}
+
+          <!-- Device Routing Section -->
+          {#if allowDeviceRouting}
+            <div class="border border-gray-200 rounded-lg overflow-hidden">
+              <button
+                type="button"
+                class="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-sm font-medium text-gray-700"
+                onclick={() => (showDeviceRouting = !showDeviceRouting)}
+                disabled={loading}
+              >
+                <span class="flex items-center gap-2">
+                  <svg
+                    class="w-4 h-4 text-purple-500"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2"
+                      d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"
+                    />
+                  </svg>
+                  Device-Based Routing
+                  {#if hasDeviceUrls}
                     <span
-                      class="bg-indigo-100 text-indigo-700 text-xs px-2 py-0.5 rounded-full"
+                      class="bg-purple-100 text-purple-700 text-xs px-2 py-0.5 rounded-full"
                       >active</span
                     >
                   {/if}
                 </span>
                 <svg
-                  class="w-4 h-4 text-gray-400 transition-transform {showUtmBuilder
+                  class="w-4 h-4 text-gray-400 transition-transform {showDeviceRouting
                     ? 'rotate-180'
                     : ''}"
                   fill="none"
@@ -742,334 +1354,116 @@
                   />
                 </svg>
               </button>
-              {#if showUtmBuilder}
-                <div class="p-4 space-y-3 border-t border-gray-200">
-                  <p class="text-xs text-gray-500 mb-4">
-                    Appended to the destination URL on every redirect.
+              {#if showDeviceRouting}
+                <div class="p-4 space-y-4 border-t border-gray-200">
+                  <p class="text-xs text-gray-500">
+                    Redirect visitors to different URLs based on their device
+                    type. Leave empty to use the default destination URL.
                   </p>
-                  <div class="space-y-3">
-                    <!-- Source -->
-                    <div class="flex items-center gap-3">
-                      <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                      >
-                        <svg
-                          class="w-4 h-4 text-gray-600"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                          />
-                        </svg>
-                      </div>
-                      <label
-                        for="modal-utm-source"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                        >Source</label
-                      >
-                      <input
-                        type="text"
-                        id="modal-utm-source"
-                        bind:value={utmSource}
-                        placeholder="e.g. newsletter"
-                        disabled={loading}
-                        class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
-                      />
-                    </div>
 
-                    <!-- Medium -->
-                    <div class="flex items-center gap-3">
-                      <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                  <!-- iOS URL -->
+                  <div class="flex items-center gap-3">
+                    <div
+                      class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                    >
+                      <svg
+                        class="w-4 h-4 text-gray-600"
+                        fill="currentColor"
+                        viewBox="0 0 24 24"
                       >
-                        <svg
-                          class="w-4 h-4 text-gray-600"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M7 8h10M7 12h4m1 8l-4-4H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-3l-4 4z"
-                          />
-                        </svg>
-                      </div>
-                      <label
-                        for="modal-utm-medium"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                        >Medium</label
-                      >
-                      <input
-                        type="text"
-                        id="modal-utm-medium"
-                        bind:value={utmMedium}
-                        placeholder="e.g. email"
-                        disabled={loading}
-                        class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
-                      />
+                        <path
+                          d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.21-1.96 1.07-3.11-1.05.05-2.31.71-3.06 1.64-.68.84-1.21 2.19-1.06 3.28 1.18.09 2.38-.59 3.05-1.81z"
+                        />
+                      </svg>
                     </div>
-
-                    <!-- Campaign -->
-                    <div class="flex items-center gap-3">
-                      <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                      >
-                        <svg
-                          class="w-4 h-4 text-gray-600"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"
-                          />
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"
-                          />
-                        </svg>
-                      </div>
-                      <label
-                        for="modal-utm-campaign"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                        >Campaign</label
-                      >
-                      <input
-                        type="text"
-                        id="modal-utm-campaign"
-                        bind:value={utmCampaign}
-                        placeholder="e.g. spring_sale"
-                        disabled={loading}
-                        class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
-                      />
-                    </div>
-
-                    <!-- Term -->
-                    <div class="flex items-center gap-3">
-                      <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                      >
-                        <svg
-                          class="w-4 h-4 text-gray-600"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
-                          />
-                        </svg>
-                      </div>
-                      <label
-                        for="modal-utm-term"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                        >Term</label
-                      >
-                      <input
-                        type="text"
-                        id="modal-utm-term"
-                        bind:value={utmTerm}
-                        placeholder="e.g. running+shoes"
-                        disabled={loading}
-                        class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
-                      />
-                    </div>
-
-                    <!-- Content -->
-                    <div class="flex items-center gap-3">
-                      <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                      >
-                        <svg
-                          class="w-4 h-4 text-gray-600"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                          />
-                        </svg>
-                      </div>
-                      <label
-                        for="modal-utm-content"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                        >Content</label
-                      >
-                      <input
-                        type="text"
-                        id="modal-utm-content"
-                        bind:value={utmContent}
-                        placeholder="e.g. banner_top"
-                        disabled={loading}
-                        class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
-                      />
-                    </div>
-
-                    <!-- Ref -->
-                    <div class="flex items-center gap-3">
-                      <div
-                        class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                      >
-                        <svg
-                          class="w-4 h-4 text-gray-600"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            stroke-width="2"
-                            d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m9.032 4.026a9.001 9.001 0 01-7.432 0m9.032-4.026A9.001 9.001 0 0112 3c-4.474 0-8.268 3.12-9.032 7.326M15 12a3 3 0 11-6 0 3 3 0 016 0z"
-                          />
-                        </svg>
-                      </div>
-                      <label
-                        for="modal-utm-ref"
-                        class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                        >Referral</label
-                      >
-                      <input
-                        type="text"
-                        id="modal-utm-ref"
-                        bind:value={utmRef}
-                        placeholder="e.g. affiliate123"
-                        disabled={loading}
-                        class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent disabled:bg-gray-100"
-                      />
-                    </div>
+                    <label
+                      for="modal-ios-url"
+                      class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                      >iOS URL</label
+                    >
+                    <input
+                      type="url"
+                      id="modal-ios-url"
+                      bind:value={iosUrl}
+                      placeholder="https://apps.apple.com/..."
+                      disabled={loading}
+                      class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 focus:border-transparent disabled:bg-gray-100"
+                    />
                   </div>
 
-                  <!-- URL Preview -->
-                  {#if destinationUrl && hasUtmParams}
-                    <div class="px-4 pb-4">
-                      <div class="text-sm font-medium text-gray-700 mb-1 block">
-                        URL Preview
-                      </div>
-                      <div
-                        class="p-3 bg-gray-50 rounded-lg border border-gray-200"
+                  <!-- Android URL -->
+                  <div class="flex items-center gap-3">
+                    <div
+                      class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                    >
+                      <svg
+                        class="w-4 h-4 text-green-600"
+                        fill="currentColor"
+                        viewBox="0 0 24 24"
                       >
-                        {@html `<p class="text-xs font-mono text-gray-600 break-all">${buildPreviewUrl()}</p>`}
-                      </div>
+                        <path
+                          d="M17.523 15.3414c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993.0001.5511-.4482.9997-.9993.9997m-11.046 0c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993 0 .5511-.4482.9997-.9993.9997m11.4045-6.02l1.9973-3.4592a.416.416 0 00-.1521-.5676.416.416 0 00-.5676.1521l-2.0225 3.503C15.5902 8.4797 13.8535 8.178 12 8.178c-1.8535 0-3.5902.3017-5.1367.8494L4.8408 5.5244a.416.416 0 00-.5676-.1521.416.416 0 00-.1521.5676l1.9973 3.4592C2.6889 11.1867.3432 14.6589.3432 18.6617h23.3136c0-4.0028-2.3457-7.475-5.775-9.3403"
+                        />
+                      </svg>
                     </div>
-                  {/if}
+                    <label
+                      for="modal-android-url"
+                      class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                      >Android URL</label
+                    >
+                    <input
+                      type="url"
+                      id="modal-android-url"
+                      bind:value={androidUrl}
+                      placeholder="https://play.google.com/..."
+                      disabled={loading}
+                      class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 focus:border-transparent disabled:bg-gray-100"
+                    />
+                  </div>
+
+                  <!-- Desktop URL -->
+                  <div class="flex items-center gap-3">
+                    <div
+                      class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
+                    >
+                      <svg
+                        class="w-4 h-4 text-gray-600"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          stroke-width="2"
+                          d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+                        />
+                      </svg>
+                    </div>
+                    <label
+                      for="modal-desktop-url"
+                      class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
+                      >Desktop URL</label
+                    >
+                    <input
+                      type="url"
+                      id="modal-desktop-url"
+                      bind:value={desktopUrl}
+                      placeholder="https://example.com/desktop-version"
+                      disabled={loading}
+                      class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 focus:border-transparent disabled:bg-gray-100"
+                    />
+                  </div>
                 </div>
               {/if}
             </div>
-          {/if}
-
-          <!-- Forward Query Params Toggle -->
-          {#if allowQueryForwarding}
+          {:else}
+            <!-- Device routing upsell for lower tiers -->
             <div
-              class="flex items-start gap-3 p-4 border border-gray-200 rounded-lg"
+              class="flex items-center gap-2 p-3 bg-gray-50 border border-dashed border-gray-300 rounded-lg text-sm text-gray-500"
             >
-              <div class="flex-1">
-                <label
-                  for="modal-forward-query-params"
-                  class="block text-sm font-medium text-gray-700"
-                >
-                  Forward visitor query parameters
-                </label>
-                <p class="text-xs text-gray-500 mt-0.5">
-                  Appends query params from the short link URL to the
-                  destination (e.g. <code class="bg-gray-100 px-1 rounded"
-                    >?ref=tw</code
-                  > passes through). Visitor params override UTM params on conflict.
-                </p>
-              </div>
-              <input
-                type="checkbox"
-                id="modal-forward-query-params"
-                bind:checked={forwardQueryParams}
-                disabled={loading}
-                class="mt-0.5 h-4 w-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"
-              />
-            </div>
-          {/if}
-        {/if}
-
-        <!-- Show upsell if neither feature is available -->
-        {#if !allowUtmParameters && !allowQueryForwarding}
-          <div
-            class="flex items-center gap-2 p-3 bg-gray-50 border border-dashed border-gray-300 rounded-lg text-sm text-gray-500"
-          >
-            <svg
-              class="w-4 h-4 text-amber-500 shrink-0"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M13 10V3L4 14h7v7l9-11h-7z"
-              />
-            </svg>
-            <span
-              ><strong class="text-gray-700">Pro feature:</strong>
-              UTM parameters &amp; query forwarding —
-              <a href="/pricing" class="text-orange-600 hover:underline"
-                >Upgrade to Pro</a
-              ></span
-            >
-          </div>
-        {/if}
-
-        <!-- Device Routing Section -->
-        {#if allowDeviceRouting}
-          <div class="border border-gray-200 rounded-lg overflow-hidden">
-            <button
-              type="button"
-              class="w-full flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-gray-100 transition-colors text-sm font-medium text-gray-700"
-              onclick={() => (showDeviceRouting = !showDeviceRouting)}
-              disabled={loading}
-            >
-              <span class="flex items-center gap-2">
-                <svg
-                  class="w-4 h-4 text-purple-500"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"
-                  />
-                </svg>
-                Device-Based Routing
-                {#if hasDeviceUrls}
-                  <span
-                    class="bg-purple-100 text-purple-700 text-xs px-2 py-0.5 rounded-full"
-                    >active</span
-                  >
-                {/if}
-              </span>
               <svg
-                class="w-4 h-4 text-gray-400 transition-transform {showDeviceRouting
-                  ? 'rotate-180'
-                  : ''}"
+                class="w-4 h-4 text-purple-500 shrink-0"
                 fill="none"
                 stroke="currentColor"
                 viewBox="0 0 24 24"
@@ -1078,139 +1472,18 @@
                   stroke-linecap="round"
                   stroke-linejoin="round"
                   stroke-width="2"
-                  d="M19 9l-7 7-7-7"
+                  d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"
                 />
               </svg>
-            </button>
-            {#if showDeviceRouting}
-              <div class="p-4 space-y-4 border-t border-gray-200">
-                <p class="text-xs text-gray-500">
-                  Redirect visitors to different URLs based on their device
-                  type. Leave empty to use the default destination URL.
-                </p>
-
-                <!-- iOS URL -->
-                <div class="flex items-center gap-3">
-                  <div
-                    class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                  >
-                    <svg
-                      class="w-4 h-4 text-gray-600"
-                      fill="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.21-1.96 1.07-3.11-1.05.05-2.31.71-3.06 1.64-.68.84-1.21 2.19-1.06 3.28 1.18.09 2.38-.59 3.05-1.81z"
-                      />
-                    </svg>
-                  </div>
-                  <label
-                    for="modal-ios-url"
-                    class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                    >iOS URL</label
-                  >
-                  <input
-                    type="url"
-                    id="modal-ios-url"
-                    bind:value={iosUrl}
-                    placeholder="https://apps.apple.com/..."
-                    disabled={loading}
-                    class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 focus:border-transparent disabled:bg-gray-100"
-                  />
-                </div>
-
-                <!-- Android URL -->
-                <div class="flex items-center gap-3">
-                  <div
-                    class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                  >
-                    <svg
-                      class="w-4 h-4 text-green-600"
-                      fill="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        d="M17.523 15.3414c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993.0001.5511-.4482.9997-.9993.9997m-11.046 0c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993 0 .5511-.4482.9997-.9993.9997m11.4045-6.02l1.9973-3.4592a.416.416 0 00-.1521-.5676.416.416 0 00-.5676.1521l-2.0225 3.503C15.5902 8.4797 13.8535 8.178 12 8.178c-1.8535 0-3.5902.3017-5.1367.8494L4.8408 5.5244a.416.416 0 00-.5676-.1521.416.416 0 00-.1521.5676l1.9973 3.4592C2.6889 11.1867.3432 14.6589.3432 18.6617h23.3136c0-4.0028-2.3457-7.475-5.775-9.3403"
-                      />
-                    </svg>
-                  </div>
-                  <label
-                    for="modal-android-url"
-                    class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                    >Android URL</label
-                  >
-                  <input
-                    type="url"
-                    id="modal-android-url"
-                    bind:value={androidUrl}
-                    placeholder="https://play.google.com/..."
-                    disabled={loading}
-                    class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 focus:border-transparent disabled:bg-gray-100"
-                  />
-                </div>
-
-                <!-- Desktop URL -->
-                <div class="flex items-center gap-3">
-                  <div
-                    class="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center flex-shrink-0"
-                  >
-                    <svg
-                      class="w-4 h-4 text-gray-600"
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                    >
-                      <path
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        stroke-width="2"
-                        d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
-                      />
-                    </svg>
-                  </div>
-                  <label
-                    for="modal-desktop-url"
-                    class="text-sm font-medium text-gray-700 w-20 flex-shrink-0"
-                    >Desktop URL</label
-                  >
-                  <input
-                    type="url"
-                    id="modal-desktop-url"
-                    bind:value={desktopUrl}
-                    placeholder="https://example.com/desktop-version"
-                    disabled={loading}
-                    class="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-purple-500 focus:border-transparent disabled:bg-gray-100"
-                  />
-                </div>
-              </div>
-            {/if}
-          </div>
-        {:else}
-          <!-- Device routing upsell for lower tiers -->
-          <div
-            class="flex items-center gap-2 p-3 bg-gray-50 border border-dashed border-gray-300 rounded-lg text-sm text-gray-500"
-          >
-            <svg
-              class="w-4 h-4 text-purple-500 shrink-0"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"
-              />
-            </svg>
-            <span
-              ><strong class="text-gray-700">Business feature:</strong>
-              Device-based routing —
-              <a href="/pricing" class="text-orange-600 hover:underline"
-                >Upgrade to Business</a
-              ></span
-            >
-          </div>
+              <span
+                ><strong class="text-gray-700">Business feature:</strong>
+                Device-based routing —
+                <a href="/pricing" class="text-orange-600 hover:underline"
+                  >Upgrade to Business</a
+                ></span
+              >
+            </div>
+          {/if}
         {/if}
 
         <!-- Status (Edit mode only) -->

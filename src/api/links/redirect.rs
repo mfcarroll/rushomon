@@ -174,45 +174,64 @@ pub async fn handle_redirect(
     };
 
     let mut destination_url = Url::parse(effective_destination)?;
+    let is_mailto = destination_url.scheme() == "mailto";
 
-    if let Some(ref utm) = mapping.utm_params {
-        let pairs: Vec<(&str, &str)> = [
-            ("utm_source", utm.utm_source.as_deref()),
-            ("utm_medium", utm.utm_medium.as_deref()),
-            ("utm_campaign", utm.utm_campaign.as_deref()),
-            ("utm_term", utm.utm_term.as_deref()),
-            ("utm_content", utm.utm_content.as_deref()),
-            ("utm_ref", utm.utm_ref.as_deref()),
-        ]
-        .into_iter()
-        .filter_map(|(k, v)| v.filter(|s| !s.is_empty()).map(|s| (k, s)))
-        .collect();
-
-        if !pairs.is_empty() {
-            let mut q = destination_url.query_pairs_mut();
-            for (k, v) in pairs {
-                q.append_pair(k, v);
-            }
-        }
-    }
-
-    if mapping.forward_query_params
-        && let Ok(incoming_url) = req.url()
-    {
-        let visitor_pairs: Vec<(String, String)> = incoming_url
-            .query_pairs()
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+    // UTM tagging and visitor query-param forwarding only make sense for
+    // http(s) destinations — appending them to a mailto: URL would corrupt the
+    // pre-filled compose window (subject/body live in the query string).
+    if !is_mailto {
+        if let Some(ref utm) = mapping.utm_params {
+            let pairs: Vec<(&str, &str)> = [
+                ("utm_source", utm.utm_source.as_deref()),
+                ("utm_medium", utm.utm_medium.as_deref()),
+                ("utm_campaign", utm.utm_campaign.as_deref()),
+                ("utm_term", utm.utm_term.as_deref()),
+                ("utm_content", utm.utm_content.as_deref()),
+                ("utm_ref", utm.utm_ref.as_deref()),
+            ]
+            .into_iter()
+            .filter_map(|(k, v)| v.filter(|s| !s.is_empty()).map(|s| (k, s)))
             .collect();
-        if !visitor_pairs.is_empty() {
-            let mut q = destination_url.query_pairs_mut();
-            for (k, v) in &visitor_pairs {
-                q.append_pair(k, v);
+
+            if !pairs.is_empty() {
+                let mut q = destination_url.query_pairs_mut();
+                for (k, v) in pairs {
+                    q.append_pair(k, v);
+                }
             }
         }
-    }
 
-    let redirect_status = mapping.redirect_type.parse::<u16>().unwrap_or(301);
-    let response = Response::redirect_with_status(destination_url, redirect_status)?;
+        if mapping.forward_query_params
+            && let Ok(incoming_url) = req.url()
+        {
+            let visitor_pairs: Vec<(String, String)> = incoming_url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            if !visitor_pairs.is_empty() {
+                let mut q = destination_url.query_pairs_mut();
+                for (k, v) in &visitor_pairs {
+                    q.append_pair(k, v);
+                }
+            }
+        }
+    } // end !is_mailto
+
+    let response = if is_mailto {
+        // Serve an HTML interstitial that opens the visitor's mail client. A
+        // plain `Location: mailto:` redirect is unreliable across browsers and
+        // in-app webviews, and mail-client launches are unsafe to depend on at
+        // the header level.
+        let html = crate::utils::mailto::render_mailto_interstitial(&destination_url);
+        let mut response = Response::from_html(html)?;
+        let headers = response.headers_mut();
+        let _ = headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
+        let _ = headers.set("X-Robots-Tag", "noindex, nofollow");
+        response
+    } else {
+        let redirect_status = mapping.redirect_type.parse::<u16>().unwrap_or(301);
+        Response::redirect_with_status(destination_url, redirect_status)?
+    };
 
     let referrer = req.headers().get("Referer").ok().flatten();
     let user_agent = req.headers().get("User-Agent").ok().flatten();

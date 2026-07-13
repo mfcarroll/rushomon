@@ -143,7 +143,17 @@ impl BlacklistRepository {
             Err(_) => return Ok(false),
         };
 
-        let domain = url.host_str().unwrap_or("");
+        // For mailto: the domain lives in the email address, not host_str().
+        let mailto_domain = if url.scheme() == "mailto" {
+            crate::utils::mailto::primary_domain(&url).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let domain = if mailto_domain.is_empty() {
+            url.host_str().unwrap_or("")
+        } else {
+            mailto_domain.as_str()
+        };
         let domain_stmt = db.prepare(
             "SELECT 1 FROM destination_blacklist
              WHERE ?1 LIKE '%' || destination || '%' AND match_type = 'domain'

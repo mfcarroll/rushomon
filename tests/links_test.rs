@@ -474,3 +474,136 @@ async fn test_update_link_utm_params() {
         .send()
         .await;
 }
+
+#[tokio::test]
+async fn test_create_mailto_link() {
+    let client = authenticated_client();
+
+    // Exact destination string the frontend Email composer builds
+    // (regression: multi-recipient create previously 400'd)
+    let destination =
+        "mailto:test@example.com,test2@example.com?subject=Subject%20test&body=Body%20of%20message";
+
+    let response = client
+        .post(format!("{}/api/links", BASE_URL))
+        .json(&json!({
+            "destination_url": destination,
+            "title": "Email us",
+            "redirect_type": "301"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let status = response.status();
+    if status != StatusCode::OK {
+        let error_text = response.text().await.unwrap();
+        panic!("Expected 200, got {} with error: {}", status, error_text);
+    }
+
+    let link: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(link["destination_url"], destination);
+    assert_eq!(link["status"], "active");
+
+    // Clean up
+    let _ = client
+        .delete(format!(
+            "{}/api/links/{}",
+            BASE_URL,
+            link["id"].as_str().unwrap()
+        ))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_create_mailto_link_with_percent_encoded_at() {
+    let client = authenticated_client();
+
+    // RFC 6068 permits percent-encoding the @; must also be accepted
+    let response = client
+        .post(format!("{}/api/links", BASE_URL))
+        .json(&json!({
+            "destination_url": "mailto:test%40example.com?subject=Hi",
+            "redirect_type": "301"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let link: serde_json::Value = response.json().await.unwrap();
+    let _ = client
+        .delete(format!(
+            "{}/api/links/{}",
+            BASE_URL,
+            link["id"].as_str().unwrap()
+        ))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_create_mailto_link_rejects_disallowed_params() {
+    let client = authenticated_client();
+
+    // RFC 6068 arbitrary header fields (e.g. reply-to) are not allowed
+    let response = client
+        .post(format!("{}/api/links", BASE_URL))
+        .json(&json!({
+            "destination_url": "mailto:a@example.com?reply-to=evil@example.com",
+            "redirect_type": "301"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_create_mailto_link_allows_missing_recipient() {
+    let client = authenticated_client();
+
+    // The recipient is optional — a subject-only mailto is valid.
+    let response = client
+        .post(format!("{}/api/links", BASE_URL))
+        .json(&json!({
+            "destination_url": "mailto:?subject=No%20recipient",
+            "redirect_type": "301"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let link: serde_json::Value = response.json().await.unwrap();
+    let _ = client
+        .delete(format!(
+            "{}/api/links/{}",
+            BASE_URL,
+            link["id"].as_str().unwrap()
+        ))
+        .send()
+        .await;
+}
+
+#[tokio::test]
+async fn test_create_mailto_link_rejects_empty() {
+    let client = authenticated_client();
+
+    // A bare mailto with no recipient and no headers is still rejected.
+    let response = client
+        .post(format!("{}/api/links", BASE_URL))
+        .json(&json!({
+            "destination_url": "mailto:",
+            "redirect_type": "301"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

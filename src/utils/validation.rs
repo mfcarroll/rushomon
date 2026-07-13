@@ -50,19 +50,20 @@ pub fn normalize_tag(tag: &str) -> Option<String> {
 }
 
 /// Validate a destination URL
-/// Must be http or https scheme
+/// Must be http, https, or mailto scheme
 pub fn validate_url(url_str: &str) -> Result<String, String> {
     match Url::parse(url_str) {
-        Ok(url) => {
-            let scheme = url.scheme();
-            if scheme != "http" && scheme != "https" {
-                return Err(format!(
-                    "Invalid URL scheme: {}. Only http and https are allowed",
-                    scheme
-                ));
+        Ok(url) => match url.scheme() {
+            "http" | "https" => Ok(url.to_string()),
+            "mailto" => {
+                crate::utils::mailto::validate_mailto(&url)?;
+                Ok(url.to_string())
             }
-            Ok(url.to_string())
-        }
+            scheme => Err(format!(
+                "Invalid URL scheme: {}. Only http, https, and mailto are allowed",
+                scheme
+            )),
+        },
         Err(e) => Err(format!("Invalid URL: {}", e)),
     }
 }
@@ -185,6 +186,21 @@ mod tests {
         assert!(validate_url("not a url").is_err());
         assert!(validate_url("").is_err());
         assert!(validate_url("htp://example.com").is_err()); // typo in scheme
+    }
+
+    #[test]
+    fn test_validate_url_accepts_mailto() {
+        assert!(validate_url("mailto:user@example.com").is_ok());
+        assert!(validate_url("mailto:user@example.com?subject=Hi&body=There").is_ok());
+        assert!(validate_url("mailto:a@example.com,b@example.com?cc=c@example.com").is_ok());
+        assert!(validate_url("mailto:?subject=No%20recipient").is_ok()); // recipient optional
+    }
+
+    #[test]
+    fn test_validate_url_rejects_invalid_mailto() {
+        assert!(validate_url("mailto:").is_err()); // empty: no recipient and no headers
+        assert!(validate_url("mailto:not-an-email").is_err()); // malformed address
+        assert!(validate_url("mailto:a@b.com?reply-to=evil@x.com").is_err()); // disallowed param
     }
 
     // Short Code Validation Tests

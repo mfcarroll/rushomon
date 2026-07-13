@@ -5,6 +5,7 @@ pub mod email;
 pub mod env;
 pub mod errors;
 pub mod http;
+pub mod mailto;
 pub mod query_params;
 pub mod short_code;
 pub mod tags;

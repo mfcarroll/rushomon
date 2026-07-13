@@ -784,3 +784,66 @@ async fn test_redirect_no_forwarding_strips_visitor_params() {
         .send()
         .await;
 }
+
+#[tokio::test]
+async fn test_mailto_redirect_serves_interstitial() {
+    let short_code =
+        create_link_and_get_code("mailto:hello@example.com?subject=Hello%20there").await;
+    let client = test_client();
+
+    let response = client
+        .get(format!("{}/{}", BASE_URL, short_code))
+        .send()
+        .await
+        .unwrap();
+
+    // mailto destinations are served as a 200 HTML interstitial, not a 30x
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        content_type.starts_with("text/html"),
+        "Expected text/html, got: {}",
+        content_type
+    );
+
+    let body = response.text().await.unwrap();
+    assert!(body.contains("window.location.href"));
+    assert!(body.contains("http-equiv=\"refresh\""));
+    assert!(
+        body.contains("hello@example.com"),
+        "Interstitial must show the recipient address"
+    );
+}
+
+#[tokio::test]
+async fn test_mailto_redirect_increments_click_count() {
+    let response = create_test_link("mailto:clicks@example.com", None).await;
+    let link: serde_json::Value = response.json().await.unwrap();
+    let short_code = link["short_code"].as_str().unwrap().to_string();
+    let link_id = link["id"].as_str().unwrap().to_string();
+
+    let client = test_client();
+    let _ = client
+        .get(format!("{}/{}", BASE_URL, short_code))
+        .send()
+        .await
+        .unwrap();
+
+    // Click logging is deferred via waitUntil; give it a moment
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    let auth_client = authenticated_client();
+    let get_response = auth_client
+        .get(format!("{}/api/links/{}", BASE_URL, link_id))
+        .send()
+        .await
+        .unwrap();
+    let fetched: serde_json::Value = get_response.json().await.unwrap();
+    assert_eq!(fetched["click_count"], 1);
+}
