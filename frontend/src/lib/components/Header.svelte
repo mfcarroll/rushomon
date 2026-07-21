@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { page } from "$app/state";
   import { PUBLIC_VITE_DOCS_URL } from "$env/static/public";
   import { backdropClose } from "$lib/actions/backdropClose";
   import { authApi } from "$lib/api/auth";
@@ -19,6 +20,12 @@
   }
 
   const { user, currentPage = "landing" }: Props = $props();
+
+  // Same rule as UserMenu: suppress only the link to where the user already
+  // is; everywhere else admins see both destinations.
+  const isOnDashboard = $derived(page.url.pathname === "/dashboard");
+  const isInAdminArea = $derived(page.url.pathname.startsWith("/admin"));
+
   let mobileMenuOpen = $state(false);
   let orgSwitcherOpen = $state(false);
   let showBilling = $state(false);
@@ -523,7 +530,7 @@
             <span>Documentation</span>
           </a>
           {#if user.role === "admin"}
-            {#if currentPage === "dashboard" || currentPage === "analytics" || currentPage === "settings"}
+            {#if !isInAdminArea}
               <a
                 href="/admin/dashboard"
                 class="mobile-nav-item"
@@ -532,7 +539,8 @@
                 <span class="mobile-nav-icon">👥</span>
                 <span>Admin Dashboard</span>
               </a>
-            {:else}
+            {/if}
+            {#if !isOnDashboard}
               <a
                 href="/dashboard"
                 class="mobile-nav-item"

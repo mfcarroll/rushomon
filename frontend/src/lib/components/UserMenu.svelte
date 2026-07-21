@@ -17,7 +17,11 @@
   let showMenu = $state(false);
   let isLoggingOut = $state(false);
 
+  // Suppress only the link to where the user already is: hide "Dashboard"
+  // on the dashboard home itself, and "Admin Dashboard" inside the admin
+  // area. Everywhere else admins see both destinations.
   const isOnDashboard = $derived(page.url.pathname === "/dashboard");
+  const isInAdminArea = $derived(page.url.pathname.startsWith("/admin"));
 
   function handleClickOutside() {
     showMenu = false;
@@ -120,7 +124,7 @@
 
       {#if user.role === "admin"}
         <div class="border-t border-gray-100 my-1"></div>
-        {#if isOnDashboard}
+        {#if !isInAdminArea}
           <a
             href="/admin/dashboard"
             role="menuitem"
@@ -128,7 +132,8 @@
           >
             👥 Admin Dashboard
           </a>
-        {:else}
+        {/if}
+        {#if !isOnDashboard}
           <a
             href="/dashboard"
             role="menuitem"
