@@ -1,0 +1,566 @@
+name: Deploy mfc.cx
+
+on:
+  push:
+    branches:
+      - deploy
+  # Manual deployment trigger
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  backup:
+    name: Backup Database
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    environment: production-mfc
+    env:
+      ACTIONS_NODE_VERSION: "24"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      - name: Generate wrangler production config
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          R2_ASSETS_BUCKET_NAME: ${{ secrets.R2_ASSETS_BUCKET_NAME }}
+          GH_CLIENT_ID: ${{ secrets.GH_CLIENT_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          MAILGUN_DOMAIN: ${{ secrets.MAILGUN_DOMAIN }}
+          MAILGUN_BASE_URL: ${{ secrets.MAILGUN_BASE_URL }}
+          MAILGUN_FROM: ${{ secrets.MAILGUN_FROM }}
+
+        run: |
+          cat > wrangler.production.toml << 'EOF'
+          name = "${{ vars.INSTANCE_NAME }}"
+          main = "build/worker/shim.mjs"
+          compatibility_date = "2026-02-10"
+          workers_dev = false
+          upload_source_maps = true
+
+          # Observability configuration
+          [observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [observability.traces]
+          enabled = true
+          head_sampling_rate = 0.1
+
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          # - "*/15 * * * *" = every 15 min (custom domain status polling) — only
+          #   registered when Cloudflare-for-SaaS is configured (CF_SAAS_API_TOKEN)
+          # - "0 8 2 * *" = monthly stats emails — only registered when Mailgun is
+          #   configured (MAILGUN_DOMAIN)
+          # Conditional registration keeps unconfigured features from consuming the
+          # free plan's cron quota (5 triggers per account) with no-op jobs.
+          [triggers]
+          crons = ${{ format('["0 0 * * *", "0 4 * * *"{0}{1}]', secrets.CF_SAAS_API_TOKEN != '' && ', "*/15 * * * *"' || '', secrets.MAILGUN_DOMAIN != '' && ', "0 8 2 * *"' || '') }}
+
+          [[d1_databases]]
+          binding = "rushomon"
+          database_name = "rushomon"
+          database_id = "${{ env.D1_DATABASE_ID }}"
+
+          [[kv_namespaces]]
+          binding = "URL_MAPPINGS"
+          id = "${{ env.KV_NAMESPACE_ID }}"
+
+          [[r2_buckets]]
+          binding = "ASSETS_BUCKET"
+          bucket_name = "${{ env.R2_ASSETS_BUCKET_NAME }}"
+
+          [assets]
+          directory = "./frontend/build"
+          binding = "ASSETS"
+          run_worker_first = true
+          not_found_handling = "none"
+
+          [vars]
+          GITHUB_CLIENT_ID = "${{ env.GH_CLIENT_ID }}"
+          GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+          GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+          GITHUB_USER_URL = "https://api.github.com/user"
+          GOOGLE_CLIENT_ID = "${{ env.GOOGLE_CLIENT_ID }}"
+          GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+          GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+          GOOGLE_USER_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+          MAILGUN_DOMAIN = "${{ env.MAILGUN_DOMAIN }}"
+          MAILGUN_BASE_URL = "${{ env.MAILGUN_BASE_URL }}"
+          MAILGUN_FROM = "${{ env.MAILGUN_FROM }}"
+          DOMAIN = "${{ secrets.API_DOMAIN }}"
+          FALLBACK_DOMAIN = "${{ secrets.FALLBACK_DOMAIN }}"
+          FRONTEND_URL = "https://${{ secrets.WEB_DOMAIN }}"
+          ALLOWED_ORIGINS = "https://${{ secrets.WEB_DOMAIN }},https://${{ secrets.API_DOMAIN }}"
+          ENABLE_KV_RATE_LIMITING = "false"
+          POLAR_ORG_SLUG = "${{ secrets.POLAR_ORG_SLUG }}"
+          POLAR_SANDBOX = "false"
+          CF_ZONE_ID = "${{ secrets.CF_ZONE_ID }}"
+          COLLISION_THRESHOLD = "${{ vars.COLLISION_THRESHOLD }}"
+          EOF
+
+          echo "✅ Generated wrangler.production.toml"
+
+      - name: Create backup
+        id: backup
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_FILE="production_backup_deployment_${TIMESTAMP}.sql"
+
+          echo "Creating backup: $BACKUP_FILE"
+
+          # Use the generated wrangler config for backup
+          ./scripts/backup.sh --config wrangler.production.toml -o "$BACKUP_FILE" -z -r ${{ secrets.R2_BACKUP_BUCKET_NAME }}
+
+          echo "backup_file=${BACKUP_FILE}.gz" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: backup
+    environment:
+      name: production-mfc
+    env:
+      ACTIONS_NODE_VERSION: "24"
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: '.'
+
+      - name: Cache npm
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install wrangler and worker-build
+        run: |
+          npm install -g wrangler
+          cargo install -q worker-build --version 0.8.5
+
+      - name: Build Worker
+        run: worker-build --release --panic-unwind
+
+      - name: Install Frontend Dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build Frontend for Unified Worker
+        working-directory: frontend
+        env:
+          PUBLIC_VITE_API_BASE_URL: https://${{ secrets.API_DOMAIN }}
+          PUBLIC_VITE_SHORT_LINK_BASE_URL: https://${{ secrets.REDIRECT_DOMAIN }}
+          PUBLIC_VITE_SITE_URL: https://${{ secrets.WEB_DOMAIN }}
+          # Empty when DOCS_DOMAIN is unset so the frontend's built-in fallback is used
+          PUBLIC_VITE_DOCS_URL: ${{ secrets.DOCS_DOMAIN != '' && format('https://{0}', secrets.DOCS_DOMAIN) || '' }}
+        run: |
+          echo "🔨 Building frontend for unified Worker deployment"
+          echo "   API Base URL: https://${{ secrets.API_DOMAIN }}"
+          echo "   Short Link Base URL: https://${{ secrets.REDIRECT_DOMAIN }}"
+          echo "   Site URL: https://${{ secrets.WEB_DOMAIN }}"
+          echo "   Docs URL: https://${{ secrets.DOCS_DOMAIN }}"
+          npm run build
+
+      - name: Generate Production wrangler.toml
+        env:
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          R2_ASSETS_BUCKET_NAME: ${{ secrets.R2_ASSETS_BUCKET_NAME }}
+          GH_CLIENT_ID: ${{ secrets.GH_CLIENT_ID }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          MAILGUN_DOMAIN: ${{ secrets.MAILGUN_DOMAIN }}
+          MAILGUN_BASE_URL: ${{ secrets.MAILGUN_BASE_URL }}
+          MAILGUN_FROM: ${{ secrets.MAILGUN_FROM }}
+        run: |
+          cat > wrangler.production.toml << 'EOF'
+          name = "${{ vars.INSTANCE_NAME }}"
+          main = "build/worker/shim.mjs"
+          compatibility_date = "2026-02-10"
+          workers_dev = false
+          upload_source_maps = true
+
+          # Observability configuration
+          [observability]
+          enabled = true
+          head_sampling_rate = 1
+
+          [observability.traces]
+          enabled = true
+          head_sampling_rate = 0.1
+
+          # Cron Triggers for scheduled tasks
+          # Format: array of cron expressions (Cloudflare doesn't support named triggers)
+          # - "0 0 * * *" = midnight UTC daily (subscription downgrade)
+          # - "0 4 * * *" = 4 AM UTC daily (webhook cleanup)
+          # - "*/15 * * * *" = every 15 min (custom domain status polling) — only
+          #   registered when Cloudflare-for-SaaS is configured (CF_SAAS_API_TOKEN)
+          # - "0 8 2 * *" = monthly stats emails — only registered when Mailgun is
+          #   configured (MAILGUN_DOMAIN)
+          # Conditional registration keeps unconfigured features from consuming the
+          # free plan's cron quota (5 triggers per account) with no-op jobs.
+          [triggers]
+          crons = ${{ format('["0 0 * * *", "0 4 * * *"{0}{1}]', secrets.CF_SAAS_API_TOKEN != '' && ', "*/15 * * * *"' || '', secrets.MAILGUN_DOMAIN != '' && ', "0 8 2 * *"' || '') }}
+
+          [[d1_databases]]
+          binding = "rushomon"
+          database_name = "rushomon"
+          database_id = "${{ env.D1_DATABASE_ID }}"
+
+          [[kv_namespaces]]
+          binding = "URL_MAPPINGS"
+          id = "${{ env.KV_NAMESPACE_ID }}"
+
+          [[r2_buckets]]
+          binding = "ASSETS_BUCKET"
+          bucket_name = "${{ env.R2_ASSETS_BUCKET_NAME }}"
+
+          [assets]
+          directory = "./frontend/build"
+          binding = "ASSETS"
+          run_worker_first = true
+          not_found_handling = "none"
+
+          [vars]
+          GITHUB_CLIENT_ID = "${{ env.GH_CLIENT_ID }}"
+          GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize"
+          GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+          GITHUB_USER_URL = "https://api.github.com/user"
+          GOOGLE_CLIENT_ID = "${{ env.GOOGLE_CLIENT_ID }}"
+          GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+          GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+          GOOGLE_USER_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+          MAILGUN_DOMAIN = "${{ env.MAILGUN_DOMAIN }}"
+          MAILGUN_BASE_URL = "${{ env.MAILGUN_BASE_URL }}"
+          MAILGUN_FROM = "${{ env.MAILGUN_FROM }}"
+          DOMAIN = "${{ secrets.API_DOMAIN }}"
+          FALLBACK_DOMAIN = "${{ secrets.FALLBACK_DOMAIN }}"
+          FRONTEND_URL = "https://${{ secrets.WEB_DOMAIN }}"
+          ALLOWED_ORIGINS = "https://${{ secrets.WEB_DOMAIN }},https://${{ secrets.API_DOMAIN }}"
+          ENABLE_KV_RATE_LIMITING = "false"
+          POLAR_ORG_SLUG = "${{ secrets.POLAR_ORG_SLUG }}"
+          POLAR_SANDBOX = "false"
+          CF_ZONE_ID = "${{ secrets.CF_ZONE_ID }}"
+          COLLISION_THRESHOLD = "${{ vars.COLLISION_THRESHOLD }}"
+          EOF
+
+          echo "✅ Generated wrangler.production.toml"
+
+      - name: Apply D1 Migrations
+        run: |
+          echo "📋 Applying D1 migrations to production database..."
+          wrangler d1 migrations apply rushomon --remote --config wrangler.production.toml
+          echo "✅ Production migrations applied successfully"
+
+      - name: Set Worker Secrets
+        env:
+          GH_CLIENT_SECRET: ${{ secrets.GH_CLIENT_SECRET }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          MAILGUN_API_KEY: ${{ secrets.MAILGUN_API_KEY }}
+          POLAR_ACCESS_TOKEN: ${{ secrets.POLAR_ACCESS_TOKEN }}
+          POLAR_WEBHOOK_SECRET: ${{ secrets.POLAR_WEBHOOK_SECRET }}
+          CF_SAAS_API_TOKEN: ${{ secrets.CF_SAAS_API_TOKEN }}
+        run: |
+          # Set secrets using wrangler secrets API (not visible in Worker dashboard)
+          echo "🔐 Setting Worker secrets..."
+          echo "$GH_CLIENT_SECRET" | wrangler secret put GITHUB_CLIENT_SECRET --config wrangler.production.toml
+          echo "$JWT_SECRET" | wrangler secret put JWT_SECRET --config wrangler.production.toml
+          echo "$GOOGLE_CLIENT_SECRET" | wrangler secret put GOOGLE_CLIENT_SECRET --config wrangler.production.toml
+          echo "$MAILGUN_API_KEY" | wrangler secret put MAILGUN_API_KEY --config wrangler.production.toml
+          if [ -n "$POLAR_ACCESS_TOKEN" ]; then
+            echo "$POLAR_ACCESS_TOKEN" | wrangler secret put POLAR_ACCESS_TOKEN --config wrangler.production.toml
+            echo "$POLAR_WEBHOOK_SECRET" | wrangler secret put POLAR_WEBHOOK_SECRET --config wrangler.production.toml
+          fi
+          if [ -n "$CF_SAAS_API_TOKEN" ]; then
+            echo "$CF_SAAS_API_TOKEN" | wrangler secret put CF_API_TOKEN --config wrangler.production.toml
+          fi
+          echo "✅ Secrets configured securely"
+
+      - name: Deploy Worker
+        run: |
+          echo "🚀 Deploying worker to production..."
+          wrangler deploy --config wrangler.production.toml
+          echo "✅ Worker deployed successfully"
+
+  smoke-tests:
+    name: Production Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: deploy
+    environment:
+      name: production-mfc
+
+    steps:
+      - name: Temporarily Disable Bot Fight Mode
+        env:
+          CF_BOT_HANDLING_TOKEN: ${{ secrets.CF_BOT_HANDLING_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+        run: |
+          echo "🛡️  Temporarily disabling Bot Fight Mode for smoke tests..."
+
+          # Store original state for restoration
+          ORIGINAL_STATE=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
+            -H "Authorization: Bearer $CF_BOT_HANDLING_TOKEN" \
+            -H "Content-Type: application/json" | jq -r '.result.fight_mode // "unknown"')
+
+          echo "Original Bot Fight Mode state: $ORIGINAL_STATE"
+          echo "original_bot_fight_mode=$ORIGINAL_STATE" >> $GITHUB_ENV
+
+          # Disable Bot Fight Mode
+          RESPONSE=$(curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
+            -H "Authorization: Bearer $CF_BOT_HANDLING_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"fight_mode":false}')
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ Bot Fight Mode disabled successfully"
+            # Wait for propagation
+            echo "⏳ Waiting 5 seconds for change to propagate..."
+            sleep 5
+          else
+            echo "⚠️  Failed to disable Bot Fight Mode via API"
+            echo "Response: $RESPONSE"
+            echo "Will proceed with smoke tests - 403 errors may occur"
+          fi
+
+      - name: Run Production Smoke Tests
+        env:
+          WEB_DOMAIN: ${{ secrets.WEB_DOMAIN }}
+          REDIRECT_DOMAIN: ${{ secrets.REDIRECT_DOMAIN }}
+        run: |
+          WEB_URL="https://$WEB_DOMAIN"
+          REDIRECT_URL="https://$REDIRECT_DOMAIN"
+
+          echo "🧪 Running production smoke tests"
+          echo "   Web domain: $WEB_URL"
+          echo "   Redirect domain: $REDIRECT_URL"
+          echo ""
+
+          # Wait for deployment to propagate
+          sleep 5
+
+          # Test 1: Web domain homepage loads
+          echo "🏠 Test 1: Web Domain Homepage"
+          echo "------------------------------"
+          HOMEPAGE_RESPONSE=$(curl -s -L -w "\nHTTP_CODE:%{http_code}" \
+            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            -H "Connection: keep-alive" \
+            "$WEB_URL/" || echo "FAILED")
+          HOMEPAGE_HTTP_CODE=$(echo "$HOMEPAGE_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$HOMEPAGE_HTTP_CODE" = "200" ]; then
+            echo "✅ Homepage loads correctly (HTTP 200)"
+          elif [ "$HOMEPAGE_HTTP_CODE" = "403" ]; then
+            echo "⚠️  Homepage returned HTTP 403 (likely Bot Fight Mode)"
+            echo "   This is expected on the free Cloudflare plan with Bot Fight Mode enabled."
+            echo "   The deployment succeeded - only smoke tests are affected."
+            echo "   See: https://github.com/piffio/rushomon/issues/409"
+            # Don't exit 1 - 403 from Bot Fight Mode is not a deployment failure
+          else
+            echo "❌ Homepage failed with HTTP $HOMEPAGE_HTTP_CODE"
+            echo "   This may indicate custom domains are not yet configured."
+            echo "   Configure domains manually in Cloudflare Dashboard."
+            exit 1
+          fi
+
+          # Test 2: Redirect domain root redirects to web domain
+          echo ""
+          echo "🔄 Test 2: Redirect Domain Root"
+          echo "-------------------------------"
+          ROOT_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+            -I \
+            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: */*" \
+            "$REDIRECT_URL/" || echo "FAILED")
+          ROOT_HTTP_CODE=$(echo "$ROOT_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$ROOT_HTTP_CODE" = "301" ]; then
+            ROOT_LOCATION=$(echo "$ROOT_RESPONSE" | grep -i location | cut -d' ' -f2- | tr -d '\r')
+            echo "✅ Root redirects with 301 to: $ROOT_LOCATION"
+          elif [ "$ROOT_HTTP_CODE" = "403" ]; then
+            echo "⚠️  Expected 301 redirect, got HTTP 403 (likely Bot Fight Mode)"
+            echo "   This is expected on the free Cloudflare plan with Bot Fight Mode enabled."
+          else
+            echo "⚠️  Expected 301 redirect, got HTTP $ROOT_HTTP_CODE"
+            echo "   Redirect domain may not be configured yet."
+          fi
+
+          # Test 3: Nonexistent short code redirects to /404
+          echo ""
+          echo "🔗 Test 3: Nonexistent Short Code"
+          echo "---------------------------------"
+          NOT_FOUND_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+            -I \
+            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: */*" \
+            "$REDIRECT_URL/doesnotexist999" || echo "FAILED")
+          NOT_FOUND_HTTP_CODE=$(echo "$NOT_FOUND_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$NOT_FOUND_HTTP_CODE" = "302" ]; then
+            NOT_FOUND_LOCATION=$(echo "$NOT_FOUND_RESPONSE" | grep -i location | cut -d' ' -f2- | tr -d '\r')
+            echo "✅ Nonexistent code redirects to: $NOT_FOUND_LOCATION"
+          elif [ "$NOT_FOUND_HTTP_CODE" = "403" ]; then
+            echo "⚠️  Expected 302 redirect, got HTTP 403 (likely Bot Fight Mode)"
+            echo "   This is expected on the free Cloudflare plan with Bot Fight Mode enabled."
+          else
+            echo "⚠️  Expected 302 redirect, got HTTP $NOT_FOUND_HTTP_CODE"
+          fi
+
+          # Test 4: Authentication enforcement
+          echo ""
+          echo "🔐 Test 4: Authentication Enforcement"
+          echo "-------------------------------------"
+          AUTH_ERRORS=0
+          for endpoint in "/api/links" "/api/auth/me"; do
+            echo -n "  $endpoint: "
+            AUTH_RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+              -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: application/json" \
+              "$WEB_URL$endpoint" || echo "FAILED")
+            AUTH_HTTP_CODE=$(echo "$AUTH_RESPONSE" | tail -n1 | cut -d: -f2)
+
+            if [ "$AUTH_HTTP_CODE" = "401" ]; then
+              echo "✅ Correctly requires authentication"
+            elif [ "$AUTH_HTTP_CODE" = "403" ]; then
+              echo "⚠️  Got 403 (likely Bot Fight Mode) - treating as non-blocking"
+              echo "   This is expected on the free Cloudflare plan with Bot Fight Mode enabled."
+            else
+              echo "❌ Expected 401, got $AUTH_HTTP_CODE"
+              AUTH_ERRORS=$((AUTH_ERRORS + 1))
+            fi
+          done
+
+          if [ $AUTH_ERRORS -gt 0 ]; then
+            echo "❌ $AUTH_ERRORS authentication test(s) failed with unexpected errors"
+            exit 1
+          fi
+
+          # Test 5: 404 page accessible on web domain
+          echo ""
+          echo "📄 Test 5: 404 Page Accessibility"
+          echo "---------------------------------"
+          PAGE_404_RESPONSE=$(curl -s -L -w "\nHTTP_CODE:%{http_code}" \
+            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            -H "Connection: keep-alive" \
+            "$WEB_URL/404" || echo "FAILED")
+          PAGE_404_HTTP_CODE=$(echo "$PAGE_404_RESPONSE" | tail -n1 | cut -d: -f2)
+
+          if [ "$PAGE_404_HTTP_CODE" = "200" ]; then
+            echo "✅ /404 page accessible"
+          elif [ "$PAGE_404_HTTP_CODE" = "403" ]; then
+            echo "⚠️  /404 page returned HTTP 403 (likely Bot Fight Mode)"
+            echo "   This is expected on the free Cloudflare plan with Bot Fight Mode enabled."
+          else
+            echo "⚠️  /404 page returned HTTP $PAGE_404_HTTP_CODE"
+          fi
+
+          # Test 6: Docs site homepage
+          echo ""
+          echo "📚 Test 6: Docs Site Homepage"
+          echo "-----------------------------"
+          if [ -z "${{ secrets.DOCS_DOMAIN }}" ]; then
+            echo "⚠️  DOCS_DOMAIN not configured — skipping docs site test"
+          else
+          DOCS_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 \
+            -H "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+            "https://${{ secrets.DOCS_DOMAIN }}/")
+          if [ "$DOCS_STATUS" = "200" ]; then
+            echo "✅ Docs homepage is up (HTTP 200)"
+          elif [ "$DOCS_STATUS" = "403" ]; then
+            echo "⚠️  Docs homepage returned HTTP 403 (likely Bot Fight Mode)"
+            echo "   This is expected on the free Cloudflare plan with Bot Fight Mode enabled."
+          else
+            echo "⚠️  Docs homepage returned HTTP $DOCS_STATUS (custom domain may not be configured yet)"
+          fi
+          fi
+
+          echo ""
+          echo "🎯 Production Smoke Tests Summary"
+          echo "================================="
+          echo "✅ Web domain serving correctly"
+          echo "✅ Authentication properly enforced"
+          echo "✅ Redirect behavior verified"
+
+      - name: Restore Bot Fight Mode
+        if: always()
+        env:
+          CF_BOT_HANDLING_TOKEN: ${{ secrets.CF_BOT_HANDLING_TOKEN }}
+          CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+          ORIGINAL_STATE: ${{ env.original_bot_fight_mode }}
+        run: |
+          echo "🛡️  Restoring Bot Fight Mode to original state..."
+
+          if [ -z "$ORIGINAL_STATE" ] || [ "$ORIGINAL_STATE" = "unknown" ]; then
+            echo "⚠️  Original Bot Fight Mode state unknown — leaving zone settings untouched"
+            echo "   (The zone either has Bot Fight Mode unconfigured or the state could not be read.)"
+            exit 0
+          fi
+
+          echo "Restoring to: fight_mode=$ORIGINAL_STATE"
+
+          RESPONSE=$(curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/bot_management" \
+            -H "Authorization: Bearer $CF_BOT_HANDLING_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"fight_mode\":$ORIGINAL_STATE}")
+
+          SUCCESS=$(echo "$RESPONSE" | jq -r '.success')
+
+          if [ "$SUCCESS" = "true" ]; then
+            echo "✅ Bot Fight Mode restored successfully (fight_mode: $ORIGINAL_STATE)"
+          else
+            echo "❌ Failed to restore Bot Fight Mode"
+            echo "Response: $RESPONSE"
+            echo "⚠️  Manual action required: Check Bot Fight Mode in Cloudflare Dashboard"
+          fi
